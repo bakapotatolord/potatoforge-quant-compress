@@ -43,6 +43,17 @@ The CLI bounds the manifest to 16 MiB and accepts up to 50,000 tensors, 64 GiB p
 
 `open_archive(path, verify_checksums=False)` skips comparing SHA-256 digests when reading tensors. Manifest and family validation, decoded size limits, and end-of-stream checks still apply. `Archive.check_integrity()` always checks every tensor's SHA-256. The manifest requires the same checksum fields in either mode.
 
+Consumers with a final CPU buffer can call `Archive.decode_into(name, output)` for a DEFLATE weight. The buffer must be writable, contiguous, and exactly the validated size. The optional libdeflate path reads one bounded stream and checks its exact compressed and decoded lengths. The same method falls back to streaming zlib. `Archive.check_tensor(name, data)` checks the decoded size and uses Windows CNG for SHA-256 when supported, with `hashlib` as the fallback. The standalone CLI uses the streaming `chunks()` API to keep its memory footprint low.
+
+### Native build provenance
+
+The package bundles `libdeflate.dll` and its upstream MIT license from the official libdeflate **1.26 Windows x86-64** release. The Python process must be Windows x64 to load this build. The decoder checks the bundled DLL's SHA-256 before loading it from its package directory. Missing, incompatible, or mismatched DLLs use zlib. CNG uses the Windows 10 or later `bcrypt.dll` SHA-256 API when available. [Upstream release and asset digest](https://github.com/ebiggers/libdeflate/releases/expanded_assets/v1.26)
+
+| File | SHA-256 |
+| --- | --- |
+| `libdeflate-1.26-windows-x86_64-bin.zip` | `043ddb575f7c14112b84a87bdb3e6f7bf2d3aed775d53af62046fe797979fcde` |
+| `libdeflate.dll` | `4d027ba4267ad402508de6c31e6b387ba1fae87790e3c4b57ae36943d1093935` |
+
 Compression stages encoded weights and fitted scales on disk until the header is known. Other tensors stream from the input. The archived tensor records and physical tensor layout are deterministic for identical input, options, and runtime versions.
 
 `verify --reference-quantized` compares passthrough and losslessly encoded tensors byte for byte. For a fitted pair, it checks the stored decoded hashes and measures relative squared error against the original quantized source. It checks that error against the cap in quantized-only mode. The BF16 cap uses the rotated BF16 reference at compression time.

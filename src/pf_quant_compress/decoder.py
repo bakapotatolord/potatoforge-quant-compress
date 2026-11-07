@@ -11,6 +11,7 @@ import sys
 import zlib
 
 from .formats import Family, classify_families, tensor_family
+from .native import NATIVE_TENSOR_LIMIT, inflate_into, libdeflate, sha256_hex
 from .safetensors_io import (
     CHUNK_BYTES, MAX_HEADER_BYTES, Checkpoint, TensorInfo, read_json_object, safetensors_header, tensor_nbytes,
 )
@@ -201,6 +202,35 @@ class Archive:
 
     def chunks(self, name: str, chunk_size: int = CHUNK_BYTES) -> Iterator[bytes]:
         return self._chunks(name, chunk_size, self._verify_checksums)
+
+    def check_tensor(self, name: str, data) -> None:
+        """Validate a contiguous buffer against its decoded manifest record."""
+        raw = memoryview(data).cast("B")
+        _require(len(raw) == self.tensors[name].nbytes, f"Decoded size does not match for {name!r}")
+        if self._verify_checksums:
+            _require(sha256_hex(raw) == self.records[name]["sha256"], f"Checksum mismatch for {name!r}")
+
+    def decode_into(self, name: str, output) -> None:
+        """Reconstruct a DEFLATE tensor into an exact-sized writable buffer."""
+        buffer = memoryview(output).cast("B")
+        record = self.records[name]
+        _require(record["codec"] == "deflate", f"Expected a DEFLATE tensor for {name!r}")
+        _require(not buffer.readonly and len(buffer) == record["decoded_bytes"], f"Invalid output buffer for {name!r}")
+        library = libdeflate() if len(buffer) <= NATIVE_TENSOR_LIMIT else None
+        if library is None:
+            offset = 0
+            for chunk in self._chunks(name, CHUNK_BYTES, verify_checksums=False):
+                end = offset + len(chunk)
+                buffer[offset:end] = chunk
+                offset = end
+        else:
+            size = record["stored_bytes"]
+            with self._container.path.open("rb") as stream:
+                stream.seek(self._container.tensors[name].offset)
+                encoded = stream.read(size)
+            _require(len(encoded) == size, f"Truncated DEFLATE payload for {name!r}")
+            inflate_into(library, encoded, buffer, name)
+        self.check_tensor(name, buffer)
 
     def _chunks(self, name: str, chunk_size: int, verify_checksums: bool) -> Iterator[bytes]:
         _require(type(chunk_size) is int and 0 < chunk_size <= CHUNK_BYTES, "Invalid tensor chunk size")

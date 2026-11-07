@@ -10,7 +10,9 @@ import numpy as np
 from safetensors import SafetensorError, TensorSpec, safe_open, serialize_file
 
 from fixtures import family, rewrite_manifest, save_fixture
+from pf_quant_compress import native
 from pf_quant_compress.archive import compress_checkpoint, decompress_archive, open_archive
+from pf_quant_compress.native import libdeflate
 from pf_quant_compress.safetensors_io import CHUNK_BYTES, Checkpoint, atomic_output
 from pf_quant_compress.verify import verify_archive
 
@@ -197,11 +199,14 @@ class ArchiveTests(unittest.TestCase):
         tensors = family("linear")
         tensors[WEIGHT] = np.tile(np.arange(-8, 8, dtype=np.int8), (2, 8))
         raw = tensors[WEIGHT].tobytes()
-        stream = zlib.compress(raw + b"x" if damage == "overlong" else raw, level=3, wbits=-15)
+        encoded = {"overlong": raw + b"x", "short": raw[:-1]}.get(damage, raw)
+        stream = zlib.compress(encoded, level=3, wbits=-15)
         if damage == "trailing":
             stream += b"x"
         elif damage == "truncated":
             stream = stream[:-1]
+        elif damage == "invalid":
+            stream = b"\x07" + stream[1:]
         records = []
         for name, tensor in tensors.items():
             is_weight = name == WEIGHT
@@ -260,6 +265,43 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual(len(b"".join(archive.chunks(WEIGHT))), archive.tensors[WEIGHT].nbytes)
             with self.assertRaisesRegex(ValueError, "Checksum mismatch"):
                 archive.check_integrity()
+
+    def test_decode_into_verifies_both_backends(self):
+        native = libdeflate()
+        for library in (None, native) if native else (None,):
+            with self.subTest(native=library is not None), patch("pf_quant_compress.decoder.libdeflate", return_value=library):
+                raw = self.write_v1_fixture()
+                with open_archive(self.archive) as archive:
+                    output = bytearray(len(raw))
+                    archive.decode_into(WEIGHT, output)
+                    self.assertEqual(output, raw)
+                    with self.assertRaisesRegex(ValueError, "Invalid output buffer"):
+                        archive.decode_into(WEIGHT, bytearray(len(raw) - 1))
+                rewrite_manifest(self.archive, self.bad, lambda manifest: manifest["tensors"][0].update(sha256="0" * 64))
+                with open_archive(self.bad) as archive, self.assertRaisesRegex(ValueError, "Checksum mismatch"):
+                    archive.decode_into(WEIGHT, output)
+                for damage, message in (
+                    ("invalid", "DEFLATE"), ("truncated", "DEFLATE"),
+                    ("overlong", "Decoded size exceeds"), ("short", "length|size"),
+                    ("trailing", "Trailing DEFLATE"),
+                ):
+                    with self.subTest(damage=damage):
+                        self.write_v1_fixture(damage=damage)
+                        with open_archive(self.archive, verify_checksums=False) as archive:
+                            with self.assertRaisesRegex(ValueError, message):
+                                archive.decode_into(WEIGHT, output)
+
+    def test_optional_native_backends_fall_back(self):
+        with patch.object(native.sysconfig, "get_platform", return_value="win-arm64"):
+            self.assertIsNone(native.libdeflate.__wrapped__())
+        with (
+            patch.object(native.sysconfig, "get_platform", return_value="win-amd64"),
+            patch.object(native, "_DLL", self.folder / "missing.dll"),
+        ):
+            self.assertIsNone(native.libdeflate.__wrapped__())
+        data = memoryview(b"PFQC checksum")
+        with patch.object(native, "_bcrypt_sha256", return_value=None):
+            self.assertEqual(native.sha256_hex(data), sha256(data).hexdigest())
 
     def test_rejects_encoded_protected_weight_and_duplicate_logical_names(self):
         self.write_v1_fixture()

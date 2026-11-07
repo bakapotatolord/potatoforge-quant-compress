@@ -12,3 +12,6 @@ dependencies = ["numpy>=1.26", "safetensors>=0.8.0"]
 
 [project.scripts]
 pf-compress = "pf_quant_compress.cli:main"
+
+[tool.setuptools.package-data]
+pf_quant_compress = ["_vendor/libdeflate-win-x64/*"]
