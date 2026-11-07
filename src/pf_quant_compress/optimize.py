@@ -7,7 +7,7 @@ import zlib
 
 import numpy as np
 
-from .decoder import DEFLATE_LEVEL, SCALE_MULTIPLIERS, validate_limits
+from .decoder import DEFLATE_LEVEL, SCALE_MULTIPLIERS, WIDE_SCALE_MULTIPLIERS, validate_limits
 from .formats import classify_weight
 from .native import NATIVE_TENSOR_LIMIT, libdeflate
 from .safetensors_io import Checkpoint, array_chunks
@@ -317,6 +317,7 @@ def optimize_weight(
     reference: Checkpoint | None = None,
     encoder: str = "zlib",
     search: str = "batch-major",
+    wide_grid: bool = False,
 ) -> Optimization | None:
     """Fit one supported family. None signals passthrough of the entire family."""
     validate_limits(target_bpw, max_error)
@@ -357,13 +358,14 @@ def optimize_weight(
         best = baseline
         if 8 * baseline.weight.nbytes / codes.size > target_bpw:
             max_scale = float(scales.max())
-            multipliers = tuple(m for m in SCALE_MULTIPLIERS[1:] if max_scale * m <= _FP32_MAX)
+            grid = WIDE_SCALE_MULTIPLIERS if wide_grid else SCALE_MULTIPLIERS
+            multipliers = tuple(m for m in grid[1:] if max_scale * m <= _FP32_MAX)
             if search == "reference":
                 candidates = ((_measure(codes, scales, reference_bits, group_size, m), None) for m in multipliers)
             else:
                 denominator = _quantized_denominator(codes, scales) if multipliers and reference_bits is None else None
                 # Reserve space for the winner, previous candidate, and next encoded output.
-                batch_size = len(SCALE_MULTIPLIERS) if encode is None else _NATIVE_BUFFER_BUDGET // codes.nbytes - 3
+                batch_size = len(grid) if encode is None else _NATIVE_BUFFER_BUDGET // codes.nbytes - 3
                 candidates = (
                     item
                     for i in range(0, len(multipliers), batch_size)

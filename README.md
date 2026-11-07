@@ -35,6 +35,14 @@ The optimizer keeps the least-distorting candidate that meets the target and sav
 
 The default search evaluates the scale grid in row batches with zlib. For comparisons, use `--search reference` to run the original serial zlib search. Use `--encoder libdeflate` to try the optional accelerated raw DEFLATE encoder. It uses the bundled Windows x64 library on weights up to 64 MiB and falls back to zlib when the library is unavailable or a weight is larger. The compressor bounds the native candidate and output buffers and reports the encoder used per weight in aggregate. Both encoders write PFQC v1 archives. Their measured stream sizes can differ, which can change which candidate wins at a given bitrate.
 
+### Experimental 4 bpw MOSS fit
+
+```powershell
+uv run pf-compress compress .\moss_image_sft_int8_convrot.safetensors --reference .\moss_image_sft_bf16.safetensors --target-bpw 4 --max-error 0.015 --wide-grid --output .\moss-4bpw.pfqc.safetensors --report .\moss-4bpw.json
+```
+
+`--wide-grid` adds multipliers up to 16×. Set `--max-error` explicitly to control the allowed distortion. The 0.015 cap admitted the 4 bpw fits on four sampled MOSS matrices. Check the report for misses and measured error across the full checkpoint. Archives that select an experimental multiplier require an updated PFQC reader, including the bundled ComfyUI decoder.
+
 ## Verification
 
 `verify` validates archive structure and the SHA-256 of every reconstructed tensor. With `--reference-quantized` it compares passthrough tensors byte for byte and measures optimized families' distortion against the quantized source. That measurement checks the cap for quantized-only fitting. A BF16-guided fit's cap is evaluated at compression against the rotated BF16 reference.

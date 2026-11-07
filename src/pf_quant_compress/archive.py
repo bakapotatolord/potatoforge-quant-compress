@@ -66,7 +66,7 @@ def _fit_record(result: Optimization) -> dict:
 def compress_checkpoint(
     source: Path | str, output: Path | str, *, target_bpw: float, max_error: float,
     protect: tuple[str, ...] = (), reference: Path | str | None = None, force: bool = False,
-    encoder: str = "zlib", search: str = "batch-major",
+    encoder: str = "zlib", search: str = "batch-major", wide_grid: bool = False,
 ) -> dict:
     source, output = Path(source), Path(output)
     inputs = (source,) if reference is None else (source, Path(reference))
@@ -107,7 +107,7 @@ def compress_checkpoint(
                 _LOG.info("Fitting %r", name)
                 fit = optimize_weight(
                     checkpoint, name, target_bpw=target_bpw, max_error=max_error, protect=protect, reference=bf16,
-                    encoder=encoder, search=search,
+                    encoder=encoder, search=search, wide_grid=wide_grid,
                 )
                 _require(fit is not None, f"Source family changed while reading {name!r}")
                 family_records[name]["fit"] = _fit_record(fit)
@@ -170,7 +170,7 @@ def compress_checkpoint(
             operation="compress", encode_seconds=encode_seconds, decode_verify_seconds=perf_counter() - encoded_at,
             encode_mib_per_second=report["source_bytes"] / (encode_seconds * 2**20),
             checksums_verified=True,
-            search=search, requested_encoder=encoder, encoder_counts=encoder_counts,
+            search=search, wide_grid=wide_grid, requested_encoder=encoder, encoder_counts=encoder_counts,
         )
     return report
 

@@ -29,6 +29,9 @@ MAX_DEFLATE_RATIO = 1100
 
 DEFLATE_LEVEL = 3
 SCALE_MULTIPLIERS = (1.0, 1.025, 1.05, 1.1, 1.2, 1.35, 1.5, 1.75, 2.0)
+WIDE_SCALE_MULTIPLIERS = SCALE_MULTIPLIERS + (
+    2.5, 3.0, 4.0, 6.0, 8.0, 10.0, 12.0, 12.5, 13.0, 13.5, 14.0, 14.5, 15.0, 15.5, 16.0,
+)
 
 
 def validate_limits(target_bpw: float, max_error: float) -> None:
@@ -289,7 +292,7 @@ class Archive:
         weight, scale = self.records[name], self.records[family.scale]
         multiplier, error = fit.get("multiplier"), fit.get("added_relative_sse")
         _require(
-            _number(multiplier) and multiplier in SCALE_MULTIPLIERS
+            _number(multiplier) and multiplier in WIDE_SCALE_MULTIPLIERS
             and _number(error) and 0 <= error <= self.settings["max_error"],
             f"Invalid multiplier or distortion cap for {name!r}",
         )

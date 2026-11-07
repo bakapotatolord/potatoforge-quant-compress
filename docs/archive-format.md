@@ -34,6 +34,8 @@ The legacy `zlib_level` field is the v1 compression preset, fixed at 3. The writ
 
 Each family record contains `family` and `fit`. The descriptor in `family` gives `weight`, `scale`, `marker`, `format`, `status`, `reason`, and `group_size`. `fit` is `null` for protected, unsupported, and malformed families. For an eligible family it records `multiplier`, `baseline_weight_bytes`, `baseline_scale_bytes`, `payload_bpw`, `all_in_bpw`, `rate_target_missed`, `added_relative_sse`, `baseline_reference_error`, and `optimized_reference_error`. Multiplier 1.0 records an exact numerical baseline. BF16 error fields are `null` for quantized-only fitting. These statistics describe the fit and are independent of the decoder.
 
+Readers validate the multiplier against the supported grid. Archives that select an experimental multiplier above 2× require a reader with the extended grid. Their schema version, layout, and reconstruction steps are the same.
+
 ## Decoding contract
 
 1. Open the file with a safetensors reader and parse the reserved metadata string. Require the format and schema version above. Match the physical tensor keys to the logical tensor records.

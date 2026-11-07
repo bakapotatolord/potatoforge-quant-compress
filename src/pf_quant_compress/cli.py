@@ -189,6 +189,7 @@ def main(argv: list[str] | None = None) -> int:
     compress.add_argument("--encoder", choices=["zlib", "libdeflate"], default="zlib", help="Raw DEFLATE encoder")
     compress.add_argument("--search", choices=["batch-major", "reference"], default="batch-major",
                           help="Exhaustive evaluation order. Reference search uses zlib.")
+    compress.add_argument("--wide-grid", action="store_true", help="Try experimental scale multipliers up to 16x")
     compress.add_argument("--protect", action="append", default=[], metavar="PREFIX", help="Protect a logical weight prefix")
     compress.add_argument("--reference", type=Path, help="Optional original BF16 checkpoint")
     compress.add_argument("--output", type=Path, help="Defaults to <model>.pfqc.safetensors")
@@ -223,7 +224,7 @@ def main(argv: list[str] | None = None) -> int:
             report = compress_checkpoint(
                 args.model, output, target_bpw=args.target_bpw, max_error=args.max_error,
                 protect=tuple(args.protect), reference=args.reference, force=args.force,
-                encoder=args.encoder, search=args.search,
+                encoder=args.encoder, search=args.search, wide_grid=args.wide_grid,
             )
         elif args.command == "decompress":
             report = decompress_archive(

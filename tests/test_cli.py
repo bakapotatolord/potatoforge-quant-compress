@@ -83,6 +83,30 @@ class CLITests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(list(second), sorted(second))
 
+    def test_wide_grid_is_opt_in_and_respects_error_cap(self):
+        args = self.compress + ["--target-bpw", "4.3", "--max-error", "0.015", "--report", str(self.report)]
+        self.invoke(args)
+        default = json.loads(self.report.read_text(encoding="utf-8"))
+        self.assertTrue(default["families"][0]["rate_target_missed"])
+        self.assertLessEqual(default["families"][0]["multiplier"], 2.0)
+
+        self.invoke(args + ["--wide-grid", "--force"])
+        wide = json.loads(self.report.read_text(encoding="utf-8"))
+        fit = wide["families"][0]
+        self.assertTrue(wide["wide_grid"])
+        self.assertFalse(fit["rate_target_missed"])
+        self.assertGreater(fit["multiplier"], 2.0)
+        self.assertLessEqual(fit["added_relative_sse"], 0.015)
+        self.invoke(["verify", str(self.archive), "--reference-quantized", str(self.source)])
+        self.invoke(["decompress", str(self.archive), "--output", str(self.restored)])
+
+        altered = self.folder / "invalid-grid.pfqc.safetensors"
+        rewrite_manifest(
+            self.archive, altered, lambda manifest: manifest["families"]["linear.weight"]["fit"].update(multiplier=16.5),
+        )
+        _, error = self.invoke(["verify", str(altered)], expected=1)
+        self.assertIn("Invalid multiplier", error)
+
     def test_decompress_skips_checksums_only_when_requested(self):
         self.invoke(self.compress)
         altered = self.folder / "altered.pfqc.safetensors"
