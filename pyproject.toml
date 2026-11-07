@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "potatoforge-quant-compress"
+version = "0.1.0"
+description = "Rate-aware storage compression for INT8 ConvRot safetensors checkpoints"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.26", "safetensors>=0.8.0"]
+
+[project.scripts]
+pf-compress = "pf_quant_compress.cli:main"
