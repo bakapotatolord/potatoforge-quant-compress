@@ -20,6 +20,7 @@ from .safetensors_io import (
 FORMAT = "potatoforge_quant_compress"
 METADATA_KEY = FORMAT + ".manifest"
 SCHEMA_VERSION = 1
+WIDE_SCHEMA_VERSION = 2
 METHOD = "wider-scale"
 MAX_MANIFEST_BYTES = 16 * 2**20
 MAX_TENSORS = 50_000
@@ -30,8 +31,9 @@ MAX_DEFLATE_RATIO = 1100
 DEFLATE_LEVEL = 3
 SCALE_MULTIPLIERS = (1.0, 1.025, 1.05, 1.1, 1.2, 1.35, 1.5, 1.75, 2.0)
 WIDE_SCALE_MULTIPLIERS = SCALE_MULTIPLIERS + (
-    2.5, 3.0, 4.0, 6.0, 8.0, 10.0, 12.0, 12.5, 13.0, 13.5, 14.0, 14.5, 15.0, 15.5, 16.0,
+    2.5, 3.0, 4.0, 6.0, 8.0, 10.0, 12.0, 12.5, 13.0, 13.5, 14.0,
 )
+_LEGACY_WIDE_MULTIPLIERS = WIDE_SCALE_MULTIPLIERS + (14.5, 15.0, 15.5, 16.0)
 
 
 def validate_limits(target_bpw: float, max_error: float) -> None:
@@ -123,7 +125,9 @@ class Archive:
         manifest = self.manifest
         _require(manifest.get("format") == FORMAT, "Unrecognized PFQC format")
         version = manifest.get("schema_version")
-        _require(type(version) is int and version == SCHEMA_VERSION, "Unsupported PFQC schema version")
+        _require(type(version) is int and version in (SCHEMA_VERSION, WIDE_SCHEMA_VERSION),
+                 "Unsupported PFQC schema version")
+        self.schema_version = version
         _require(
             isinstance(manifest.get("compressor_version"), str) and bool(manifest["compressor_version"])
             and manifest.get("source_format") == "safetensors"
@@ -291,8 +295,9 @@ class Archive:
         )
         weight, scale = self.records[name], self.records[family.scale]
         multiplier, error = fit.get("multiplier"), fit.get("added_relative_sse")
+        allowed = _LEGACY_WIDE_MULTIPLIERS if self.schema_version == SCHEMA_VERSION else WIDE_SCALE_MULTIPLIERS
         _require(
-            _number(multiplier) and multiplier in WIDE_SCALE_MULTIPLIERS
+            _number(multiplier) and multiplier in allowed
             and _number(error) and 0 <= error <= self.settings["max_error"],
             f"Invalid multiplier or distortion cap for {name!r}",
         )
@@ -372,7 +377,7 @@ class Archive:
         fitted_bytes = stored_weights + stored_scales
         optimized = len(multipliers)
         return {
-            "format": FORMAT, "schema_version": SCHEMA_VERSION, "method": METHOD, "zlib_level": DEFLATE_LEVEL,
+            "format": FORMAT, "schema_version": self.schema_version, "method": METHOD, "zlib_level": DEFLATE_LEVEL,
             "settings": self.settings, "tensor_count": len(self.records), "source_bytes": source_bytes,
             "archive_bytes": self.file_bytes, "reconstructed_bytes": self.reconstructed_bytes,
             "archive_fraction_of_source": self.file_bytes / source_bytes,

@@ -1,4 +1,4 @@
-# PFQC safetensors format v1
+# PFQC safetensors format v1 and v2
 
 A `<model-name>.pfqc.safetensors` file is a valid safetensors container. Its `__metadata__` string map contains the key `potatoforge_quant_compress.manifest`. The value is a JSON object serialized as a UTF-8 string. Readers use that key, the manifest's `format`, and its `schema_version` to identify the file, regardless of its name. Original checkpoint metadata lives in the manifest's `metadata` field. [Safetensors format](https://github.com/safetensors/safetensors/blob/main/README.md)
 
@@ -11,7 +11,7 @@ An encoded weight is physically a one-dimensional `U8` tensor (`torch.uint8`) co
 | Field | Value |
 | --- | --- |
 | `format` | `potatoforge_quant_compress` |
-| `schema_version` | Integer `1` |
+| `schema_version` | Integer `1` or `2`. Writers use v2 when any selected multiplier is outside the original v1 grid. |
 | `compressor_version` | Version of the writer |
 | `source_format` | `safetensors` |
 | `method`, `zlib_level` | `wider-scale`, `3` |
@@ -34,7 +34,7 @@ The legacy `zlib_level` field is the v1 compression preset, fixed at 3. The writ
 
 Each family record contains `family` and `fit`. The descriptor in `family` gives `weight`, `scale`, `marker`, `format`, `status`, `reason`, and `group_size`. `fit` is `null` for protected, unsupported, and malformed families. For an eligible family it records `multiplier`, `baseline_weight_bytes`, `baseline_scale_bytes`, `payload_bpw`, `all_in_bpw`, `rate_target_missed`, `added_relative_sse`, `baseline_reference_error`, and `optimized_reference_error`. Multiplier 1.0 records an exact numerical baseline. BF16 error fields are `null` for quantized-only fitting. These statistics describe the fit and are independent of the decoder.
 
-Readers validate the multiplier against the supported grid. Archives that select an experimental multiplier above 2× require a reader with the extended grid. Their schema version, layout, and reconstruction steps are the same.
+Readers validate multipliers against the grid for the archive version. V2 supports the experimental grid up to 14×. V1 readers in this release also accept previously written experimental v1 archives with multipliers up to 16×. The version check lets older readers reject new v2 archives before reconstruction. Both versions use the same tensor layout, raw DEFLATE codec, and checksum rules.
 
 ## Decoding contract
 

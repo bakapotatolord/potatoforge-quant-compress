@@ -38,10 +38,12 @@ The default search evaluates the scale grid in row batches with zlib. For compar
 ### Experimental 4 bpw MOSS fit
 
 ```powershell
-uv run pf-compress compress .\moss_image_sft_int8_convrot.safetensors --reference .\moss_image_sft_bf16.safetensors --target-bpw 4 --max-error 0.015 --wide-grid --output .\moss-4bpw.pfqc.safetensors --report .\moss-4bpw.json
+uv run pf-compress compress .\moss_image_sft_int8_convrot.safetensors --reference .\moss_image_sft_bf16.safetensors --target-bpw 4 --max-error 0.015 --wide-grid --encoder libdeflate --output .\moss-4bpw.pfqc.safetensors --report .\moss-4bpw.json --verbose
 ```
 
-`--wide-grid` adds multipliers up to 16×. Set `--max-error` explicitly to control the allowed distortion. The 0.015 cap admitted the 4 bpw fits on four sampled MOSS matrices. Check the report for misses and measured error across the full checkpoint. Archives that select an experimental multiplier require an updated PFQC reader, including the bundled ComfyUI decoder.
+`--wide-grid` adds multipliers up to 14× and requires an explicit error cap above 0.001. The 0.015 cap admitted 4 bpw fits on sampled MOSS matrices. The target applies to weight payloads. The report includes the bitrate with scales, misses, BF16-reference error, and the actual encoder for each fit. Archives that select a multiplier above 2× use schema v2 and require an updated PFQC reader, including the bundled ComfyUI decoder.
+
+When a native BF16 fit spans multiple candidate groups, the optimizer can retain up to 256 MiB of cached reference data plus tile-sized working buffers. The cache holds FP32 tiles with FP64 corrections for values FP32 cannot represent exactly. Tiles that do not fit the cache are rotated on demand.
 
 ## Verification
 

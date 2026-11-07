@@ -11,7 +11,7 @@ from pf_quant_compress.archive import compress_checkpoint
 from pf_quant_compress.decoder import open_archive
 from pf_quant_compress.native import libdeflate
 from pf_quant_compress.optimize import (
-    SCALE_MULTIPLIERS, _measure_batch, _requantize, _rotate_bf16, encoded_chunks, optimize_weight,
+    SCALE_MULTIPLIERS, _ReferenceCache, _measure_batch, _requantize, _rotate_bf16, encoded_chunks, optimize_weight,
 )
 from pf_quant_compress.safetensors_io import Checkpoint
 from pf_quant_compress.verify import verify_archive
@@ -149,6 +149,47 @@ class OptimizerTests(unittest.TestCase):
                 fit = optimize_weight(source, "linear.weight", encoder="libdeflate", **options)
                 self.assertEqual(fit.encoder, "zlib")
                 self.assertEqual(fit.selected, expected.selected)
+
+    @unittest.skipUnless(libdeflate(), "Requires the bundled Windows x64 libdeflate")
+    def test_native_reference_cache_matches_uncached_multi_group_fit(self):
+        codes = np.random.default_rng(817).integers(-16, 16, (24, 1024), dtype=np.int8)
+        scales = np.full((len(codes), 1), .125, dtype="<f4")
+        source = self.write_source(codes, scales)
+        weights = codes * scales
+        guide = (weights.reshape(-1, 4) @ H4.T).reshape(codes.shape)
+        reference = self.write_reference(bf16_bits(guide))
+        settings = dict(target_bpw=4.3, max_error=.015, wide_grid=True, reference=reference, encoder="libdeflate")
+        with (
+            patch("pf_quant_compress.optimize._NATIVE_BUFFER_BUDGET", codes.nbytes * 4),
+            patch("pf_quant_compress.optimize._BATCH_WEIGHTS", 4096),
+            patch("pf_quant_compress.optimize._rotate_bf16", wraps=_rotate_bf16) as rotate,
+        ):
+            cached = optimize_weight(source, "linear.weight", **settings)
+            cached_calls = rotate.call_count
+            rotate.reset_mock()
+            with patch("pf_quant_compress.optimize._REFERENCE_CACHE_BUDGET", 0):
+                uncached = optimize_weight(source, "linear.weight", **settings)
+            uncached_calls = rotate.call_count
+            rotate.reset_mock()  # Release the BF16 file mappings held in recorded calls.
+            self.assertLess(cached_calls, uncached_calls)
+        self.assertEqual(cached.selected, uncached.selected)
+        self.assertEqual(cached.baseline, uncached.baseline)
+        self.assertEqual(cached.codes.tobytes(), uncached.codes.tobytes())
+        self.assertEqual(cached.scales.tobytes(), uncached.scales.tobytes())
+        self.assertEqual(cached.encoded_weight, uncached.encoded_weight)
+
+    def test_reference_cache_restores_fp64_exceptions_and_respects_budget(self):
+        bits = np.zeros((2, 256), dtype="<u2")
+        bits[:, :4] = [0x3f80, 0x3380, 0x8000, 0]
+        expected = _rotate_bf16(bits, 4).view(np.uint64)
+        with patch("pf_quant_compress.optimize._REFERENCE_CACHE_BUDGET", 1100):
+            cache = _ReferenceCache(bits, 4)
+        for _ in range(2):
+            for row in range(2):
+                rows = slice(row, row + 1)
+                np.testing.assert_array_equal(cache(rows).view(np.uint64), expected[rows])
+        self.assertGreater(cache.tiles[0][1].size, 0)
+        self.assertNotIn(1, cache.tiles)
 
     @unittest.skipUnless(libdeflate(), "Requires the bundled Windows x64 libdeflate")
     def test_libdeflate_winner_stream_is_written_and_read_by_zlib(self):

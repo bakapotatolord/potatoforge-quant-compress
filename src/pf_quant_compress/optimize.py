@@ -16,6 +16,8 @@ from .safetensors_io import Checkpoint, array_chunks
 _BATCH_WEIGHTS = 256 * 1024
 _FP32_MAX = float(np.finfo(np.float32).max)
 _NATIVE_BUFFER_BUDGET = 256 * 2**20
+_REFERENCE_CACHE_BUDGET = 256 * 2**20
+DEFAULT_MAX_ERROR = 0.001
 
 
 @dataclass(frozen=True)
@@ -64,13 +66,15 @@ def _deflater():
     return zlib.compressobj(DEFLATE_LEVEL, wbits=-zlib.MAX_WBITS)
 
 
-def validate_optimizer_options(encoder: str, search: str) -> None:
+def validate_optimizer_options(encoder: str, search: str, wide_grid: bool, max_error: float) -> None:
     if encoder not in ("zlib", "libdeflate"):
         raise ValueError(f"Unsupported encoder {encoder!r}")
     if search not in ("batch-major", "reference"):
         raise ValueError(f"Unsupported search {search!r}")
     if search == "reference" and encoder != "zlib":
         raise ValueError("The reference search requires the zlib encoder")
+    if wide_grid and max_error <= DEFAULT_MAX_ERROR:
+        raise ValueError(f"The experimental wide grid requires max_error > {DEFAULT_MAX_ERROR:g}")
 
 
 @contextmanager
@@ -143,6 +147,50 @@ def _rotate_bf16(bits: np.ndarray, group_size: int) -> np.ndarray:
     return rotated
 
 
+class _ReferenceCache:
+    """Keep compact reference tiles and only the FP64 values FP32 cannot represent exactly."""
+
+    def __init__(self, bits: np.ndarray, group_size: int):
+        self.bits = bits
+        self.group_size = group_size
+        self.tiles = {}
+        self.remaining = _REFERENCE_CACHE_BUDGET
+
+    def __call__(self, rows: slice) -> np.ndarray:
+        start = rows.start
+        tile = self.tiles.get(start)
+        if tile is not None:
+            compact, indices, exact = tile
+            try:
+                target = compact.astype(np.float64)
+                target.reshape(-1)[indices] = exact
+                return target
+            except MemoryError:
+                self.tiles.clear()
+                self.remaining = 0
+
+        target = _rotate_bf16(self.bits[rows], self.group_size)
+        if start in self.tiles or self.remaining < target.size * 4:
+            return target
+        try:
+            with np.errstate(over="ignore", under="ignore"):
+                compact = target.astype(np.float32)
+            restored = compact.astype(np.float64)
+            indices = np.flatnonzero(target.view(np.uint64) != restored.view(np.uint64)).astype(np.int32)
+            # Keep exception lists sparse so more tiles fit the cache budget.
+            exception_bytes = indices.size * 12
+            size = compact.nbytes + exception_bytes
+            if exception_bytes <= target.size and size <= self.remaining:
+                self.tiles[start] = (compact, indices, target.reshape(-1)[indices])
+                self.remaining -= size
+            else:
+                self.tiles[start] = None
+        except MemoryError:
+            self.tiles.clear()
+            self.remaining = 0
+        return target
+
+
 def _requantize(target: np.ndarray, codes: np.ndarray, scales: np.ndarray, multiplier: float):
     return _requantize_batch(target, scales, scales.astype(np.float64), ~np.any(codes, axis=1), multiplier)
 
@@ -167,7 +215,7 @@ def _row_slices(codes):
         yield slice(start, start + batch_rows)
 
 
-def _candidate_rows(codes, scales, reference, group_size, multiplier):
+def _candidate_rows(codes, scales, reference, group_size, multiplier, cache=None):
     for rows in _row_slices(codes):
         q0, s0 = codes[rows], scales[rows]
         if multiplier == 1.0 and reference is None:
@@ -175,7 +223,9 @@ def _candidate_rows(codes, scales, reference, group_size, multiplier):
             continue
 
         original = np.multiply(q0, s0, dtype=np.float64)
-        target = original if reference is None else _rotate_bf16(reference[rows], group_size)
+        target = original if reference is None else (
+            _rotate_bf16(reference[rows], group_size) if cache is None else cache(rows)
+        )
         q1, s1 = (q0, s0) if multiplier == 1.0 else _requantize(target, q0, s0, multiplier)
         yield rows, q1, s1, original, target
 
@@ -240,7 +290,7 @@ def _quantized_denominator(codes, scales):
     return max(energy, float(np.finfo(np.float64).tiny))
 
 
-def _measure_batch(codes, scales, reference, group_size, multipliers, encode, denominator, max_error):
+def _measure_batch(codes, scales, reference, group_size, multipliers, encode, denominator, max_error, cache=None):
     trials = [
         _Trial(m, stream=_deflater()) if encode is None else
         _Trial(m, codes=codes if m == 1.0 else np.empty_like(codes, subok=False))
@@ -250,7 +300,9 @@ def _measure_batch(codes, scales, reference, group_size, multipliers, encode, de
     for rows in _row_slices(codes):
         q0, s0 = codes[rows], scales[rows]
         original = np.multiply(q0, s0, dtype=np.float64)
-        target = original if reference is None else _rotate_bf16(reference[rows], group_size)
+        target = original if reference is None else (
+            _rotate_bf16(reference[rows], group_size) if cache is None else cache(rows)
+        )
         if denominator is None:
             energy += float(np.sum(target * target))
         original_residual = None if reference is None else original - target
@@ -321,7 +373,7 @@ def optimize_weight(
 ) -> Optimization | None:
     """Fit one supported family. None signals passthrough of the entire family."""
     validate_limits(target_bpw, max_error)
-    validate_optimizer_options(encoder, search)
+    validate_optimizer_options(encoder, search, wide_grid, max_error)
     family = classify_weight(checkpoint, weight, protect)
     if family.status != "eligible":
         return None
@@ -339,6 +391,7 @@ def optimize_weight(
 
     group_size = family.group_size
     native_limit = min(NATIVE_TENSOR_LIMIT, _NATIVE_BUFFER_BUDGET // 4)
+    cache = None
     with _native_encoder(encoder == "libdeflate" and codes.nbytes <= native_limit) as encode:
         best_payload = None
         try:
@@ -366,12 +419,17 @@ def optimize_weight(
                 denominator = _quantized_denominator(codes, scales) if multipliers and reference_bits is None else None
                 # Reserve space for the winner, previous candidate, and next encoded output.
                 batch_size = len(grid) if encode is None else _NATIVE_BUFFER_BUDGET // codes.nbytes - 3
+                if encode is not None and reference_bits is not None and len(multipliers) > batch_size:
+                    try:
+                        cache = _ReferenceCache(reference_bits, group_size)
+                    except MemoryError:
+                        pass
                 candidates = (
                     item
                     for i in range(0, len(multipliers), batch_size)
                     for item in _measure_batch(
                         codes, scales, reference_bits, group_size, multipliers[i:i + batch_size],
-                        encode, denominator, max_error,
+                        encode, denominator, max_error, cache,
                     )
                 )
             for trial, payload in candidates:
@@ -383,7 +441,7 @@ def optimize_weight(
     if best is not baseline:
         optimized_codes = np.empty_like(codes, subok=False)
         optimized_scales = np.empty_like(scales, subok=False)
-        for rows, q1, s1, _, _ in _candidate_rows(codes, scales, reference_bits, group_size, best.multiplier):
+        for rows, q1, s1, _, _ in _candidate_rows(codes, scales, reference_bits, group_size, best.multiplier, cache):
             optimized_codes[rows] = q1
             optimized_scales[rows] = s1
         codes, scales = optimized_codes, optimized_scales

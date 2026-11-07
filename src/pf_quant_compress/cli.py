@@ -9,13 +9,13 @@ from safetensors import SafetensorError
 
 from .archive import Archive, METHOD, compress_checkpoint, decompress_archive, has_compression_metadata
 from .formats import inspect_checkpoint
+from .optimize import DEFAULT_MAX_ERROR
 from .safetensors_io import Checkpoint, atomic_output, validate_output
 from .verify import verify_archive
 
 
 _COMPRESSED_SUFFIX = ".pfqc.safetensors"
 _SAFETENSORS_SUFFIX = ".safetensors"
-_DEFAULT_MAX_ERROR = 0.001
 
 
 def _default_output(command: str, model: Path) -> Path | None:
@@ -63,7 +63,8 @@ def _print_archive_report(report: dict, output: Path | None, verbose: bool) -> N
         return
     if operation == "compress":
         print(f"Source {_size(report['source_bytes'])}")
-        print(f"Archive {_size(report['archive_bytes'])}, {report['archive_fraction_of_source']:.2%} of source")
+        print(f"PFQC v{report['schema_version']} archive {_size(report['archive_bytes'])}, "
+              f"{report['archive_fraction_of_source']:.2%} of source")
         print(f"Reconstructed checkpoint {_size(report['reconstructed_bytes'])}")
         print(
             f"{report['eligible_family_count']:,} eligible, {report['optimized_family_count']:,} optimized, "
@@ -91,6 +92,8 @@ def _print_archive_report(report: dict, output: Path | None, verbose: bool) -> N
         if report["encoder_counts"]:
             encoders = ", ".join(f"{name}: {count:,}" for name, count in sorted(report["encoder_counts"].items()))
             print(f"Fit encoders per weight ({encoders})")
+            if report["requested_encoder"] == "libdeflate" and "zlib" in report["encoder_counts"]:
+                print(f"Zlib fallback used for {report['encoder_counts']['zlib']:,} eligible weights.")
         if report["max_added_relative_sse"] is not None:
             print(
                 f"Added relative SSE {report['mean_added_relative_sse']:.6g} mean, "
@@ -108,7 +111,8 @@ def _print_archive_report(report: dict, output: Path | None, verbose: bool) -> N
                 miss = ", target missed" if fit["rate_target_missed"] else ""
                 print(
                     f"  {fit['weight']!r}  {before:,} -> {after:,} bytes, {fit['payload_bpw']:.3f} bpw, "
-                    f"scale x{fit['multiplier']:g}, added SSE {fit['added_relative_sse']:.6g}{delta}{miss}"
+                    f"{fit['encoder']}, scale x{fit['multiplier']:g}, "
+                    f"added SSE {fit['added_relative_sse']:.6g}{delta}{miss}"
                 )
     elif operation == "decompress":
         print(f"Reconstructed {report['tensor_count']:,} tensors to {output} ({_size(report['reconstructed_bytes'])})")
@@ -182,14 +186,15 @@ def main(argv: list[str] | None = None) -> int:
     compress.add_argument("model", type=Path)
     compress.add_argument("--target-bpw", required=True, type=float, help="Target coded bits per eligible weight")
     compress.add_argument(
-        "--max-error", default=_DEFAULT_MAX_ERROR, type=float,
+        "--max-error", default=DEFAULT_MAX_ERROR, type=float,
         help="Per-tensor added relative squared error cap (default %(default)s)",
     )
     compress.add_argument("--method", choices=[METHOD], default=METHOD)
     compress.add_argument("--encoder", choices=["zlib", "libdeflate"], default="zlib", help="Raw DEFLATE encoder")
     compress.add_argument("--search", choices=["batch-major", "reference"], default="batch-major",
                           help="Exhaustive evaluation order. Reference search uses zlib.")
-    compress.add_argument("--wide-grid", action="store_true", help="Try experimental scale multipliers up to 16x")
+    compress.add_argument("--wide-grid", action="store_true",
+                          help="Try experimental scale multipliers up to 14x (requires --max-error > 0.001)")
     compress.add_argument("--protect", action="append", default=[], metavar="PREFIX", help="Protect a logical weight prefix")
     compress.add_argument("--reference", type=Path, help="Optional original BF16 checkpoint")
     compress.add_argument("--output", type=Path, help="Defaults to <model>.pfqc.safetensors")

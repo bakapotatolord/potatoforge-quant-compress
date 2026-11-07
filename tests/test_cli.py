@@ -87,11 +87,13 @@ class CLITests(unittest.TestCase):
         args = self.compress + ["--target-bpw", "4.3", "--max-error", "0.015", "--report", str(self.report)]
         self.invoke(args)
         default = json.loads(self.report.read_text(encoding="utf-8"))
+        self.assertEqual(default["schema_version"], 1)
         self.assertTrue(default["families"][0]["rate_target_missed"])
         self.assertLessEqual(default["families"][0]["multiplier"], 2.0)
 
         self.invoke(args + ["--wide-grid", "--force"])
         wide = json.loads(self.report.read_text(encoding="utf-8"))
+        self.assertEqual(wide["schema_version"], 2)
         fit = wide["families"][0]
         self.assertTrue(wide["wide_grid"])
         self.assertFalse(fit["rate_target_missed"])
@@ -100,12 +102,31 @@ class CLITests(unittest.TestCase):
         self.invoke(["verify", str(self.archive), "--reference-quantized", str(self.source)])
         self.invoke(["decompress", str(self.archive), "--output", str(self.restored)])
 
+        # V1 archives written during the wider-grid experiment remain readable.
+        legacy = self.folder / "legacy-wide.pfqc.safetensors"
+        def legacy_fit(manifest):
+            manifest.update(schema_version=1)
+            manifest["families"]["linear.weight"]["fit"].update(multiplier=16.0)
+
+        rewrite_manifest(self.archive, legacy, legacy_fit)
+        self.invoke(["verify", str(legacy)])
+
         altered = self.folder / "invalid-grid.pfqc.safetensors"
         rewrite_manifest(
             self.archive, altered, lambda manifest: manifest["families"]["linear.weight"]["fit"].update(multiplier=16.5),
         )
         _, error = self.invoke(["verify", str(altered)], expected=1)
         self.assertIn("Invalid multiplier", error)
+
+    def test_wide_grid_requires_a_higher_cap_and_only_upgrades_when_selected(self):
+        args = self.compress + ["--target-bpw", "8", "--wide-grid", "--report", str(self.report)]
+        _, error = self.invoke(args + ["--max-error", "0.001"], expected=1)
+        self.assertIn("requires max_error > 0.001", error)
+        self.assertFalse(self.archive.exists())
+        self.invoke(args)
+        report = json.loads(self.report.read_text(encoding="utf-8"))
+        self.assertEqual(report["schema_version"], 1)
+        self.assertEqual(report["families"][0]["multiplier"], 1.0)
 
     def test_decompress_skips_checksums_only_when_requested(self):
         self.invoke(self.compress)

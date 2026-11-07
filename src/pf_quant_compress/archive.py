@@ -12,7 +12,8 @@ from safetensors import safe_open
 from . import __version__
 from .decoder import (
     Archive, DEFLATE_LEVEL, FORMAT, METADATA_KEY, METHOD, SCHEMA_VERSION, MAX_DECODED_BYTES,
-    MAX_MANIFEST_BYTES, MAX_TENSOR_BYTES, MAX_TENSORS, _require, _validate_settings, open_archive,
+    MAX_MANIFEST_BYTES, MAX_TENSOR_BYTES, MAX_TENSORS, SCALE_MULTIPLIERS, WIDE_SCHEMA_VERSION,
+    _require, _validate_settings, open_archive,
 )
 from .formats import classify_families, tensor_family
 from .optimize import MemberSize, Optimization, encoded_chunks, optimize_weight, validate_optimizer_options
@@ -75,7 +76,7 @@ def compress_checkpoint(
         "reference_mode": "quantized-only" if reference is None else "bf16",
     }
     _validate_settings(settings)
-    validate_optimizer_options(encoder, search)
+    validate_optimizer_options(encoder, search, wide_grid, max_error)
     started = perf_counter()
     with atomic_output(output, force=force, inputs=inputs) as temporary:
         checkpoint = ordinary_checkpoint(source)
@@ -97,6 +98,8 @@ def compress_checkpoint(
         }
         family_records = {}
         encoder_counts = {}
+        fit_encoders = {}
+        schema_version = SCHEMA_VERSION
         # Only encoded weights and changed scales need staging before the safetensors header is known.
         staged_offsets = {}
         with TemporaryFile(mode="w+b", dir=output.parent, prefix=".pfqc-", suffix=".tmp") as staged:
@@ -112,6 +115,11 @@ def compress_checkpoint(
                 _require(fit is not None, f"Source family changed while reading {name!r}")
                 family_records[name]["fit"] = _fit_record(fit)
                 encoder_counts[fit.encoder] = encoder_counts.get(fit.encoder, 0) + 1
+                fit_encoders[name] = fit.encoder
+                if fit.encoder != encoder:
+                    _LOG.info("Used %s fallback for %r", fit.encoder, name)
+                if fit.selected.multiplier not in SCALE_MULTIPLIERS:
+                    schema_version = WIDE_SCHEMA_VERSION
                 modified = fit.selected.multiplier != 1
                 for key, values, size in (
                     (name, fit.codes, fit.selected.weight), (family.scale, fit.scales, fit.selected.scale),
@@ -127,6 +135,7 @@ def compress_checkpoint(
                         tensors[key]["storage"] = "encoded_int8"
                 del fit, values
 
+            staged_bytes = staged.tell()
             for name, record in tensors.items():
                 if name not in staged_offsets:
                     digest = sha256()
@@ -134,7 +143,7 @@ def compress_checkpoint(
                         digest.update(chunk)
                     record.update(sha256=digest.hexdigest(), stored_bytes=record["decoded_bytes"], codec="stored")
             manifest = {
-                "format": FORMAT, "schema_version": SCHEMA_VERSION, "compressor_version": __version__,
+                "format": FORMAT, "schema_version": schema_version, "compressor_version": __version__,
                 "source_format": "safetensors", "method": METHOD, "zlib_level": DEFLATE_LEVEL,
                 "settings": settings, "metadata": checkpoint.metadata, "source_bytes": checkpoint.file_bytes,
                 "tensors": list(tensors.values()), "families": family_records,
@@ -165,11 +174,15 @@ def compress_checkpoint(
         with open_archive(temporary) as packed:
             packed.check_integrity()
             report = packed.report()
+        for family in report["families"]:
+            if family["weight"] in fit_encoders:
+                family["encoder"] = fit_encoders[family["weight"]]
         encode_seconds = encoded_at - started
         report.update(
             operation="compress", encode_seconds=encode_seconds, decode_verify_seconds=perf_counter() - encoded_at,
             encode_mib_per_second=report["source_bytes"] / (encode_seconds * 2**20),
             checksums_verified=True,
+            peak_temporary_file_bytes=staged_bytes + report["archive_bytes"],
             search=search, wide_grid=wide_grid, requested_encoder=encoder, encoder_counts=encoder_counts,
         )
     return report

@@ -149,7 +149,7 @@ class ArchiveTests(unittest.TestCase):
                     verify_archive(self.bad)
         self.compress()
         for update, message in (
-            (lambda manifest: manifest.update(schema_version=2), "schema version"),
+            (lambda manifest: manifest.update(schema_version=3), "schema version"),
             (lambda manifest: manifest.update(format="other"), "format"),
             (lambda manifest: manifest.update(tensors=[]), "missing storage tensors"),
             (lambda manifest: manifest["tensors"][0].update(name="missing"), "Missing storage tensor"),
