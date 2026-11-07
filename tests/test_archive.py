@@ -169,11 +169,11 @@ class ArchiveTests(unittest.TestCase):
             ("MAX_MANIFEST_BYTES", 64, "manifest"),
             ("MAX_DECODED_BYTES", 64, "total decoded"),
         ):
-            with self.subTest(limit=limit), patch(f"pf_quant_compress.archive.{limit}", value):
+            with self.subTest(limit=limit), patch(f"pf_quant_compress.decoder.{limit}", value):
                 with self.assertRaisesRegex(ValueError, message):
                     verify_archive(self.archive)
         self.write_v1_fixture()
-        with patch("pf_quant_compress.archive.MAX_DEFLATE_RATIO", 1):
+        with patch("pf_quant_compress.decoder.MAX_DEFLATE_RATIO", 1):
             with self.assertRaisesRegex(ValueError, "compression ratio"):
                 verify_archive(self.archive)
 

@@ -1,16 +1,14 @@
 from collections.abc import Iterator
 from dataclasses import dataclass
-import math
 import zlib
 
 import numpy as np
 
+from .decoder import DEFLATE_LEVEL, SCALE_MULTIPLIERS, validate_limits
 from .formats import classify_weight
 from .safetensors_io import Checkpoint, array_chunks
 
 
-DEFLATE_LEVEL = 3
-SCALE_MULTIPLIERS = (1.0, 1.025, 1.05, 1.1, 1.2, 1.35, 1.5, 1.75, 2.0)
 _BATCH_WEIGHTS = 256 * 1024
 _FP32_MAX = float(np.finfo(np.float32).max)
 
@@ -171,13 +169,6 @@ def _rank(candidate: Candidate, weight_count: int, target_bpw: float) -> tuple:
     if 8 * candidate.weight.nbytes / weight_count <= target_bpw:
         return (False, distortion, candidate.total_bytes, candidate.multiplier)
     return (True, candidate.total_bytes, distortion, candidate.multiplier)
-
-
-def validate_limits(target_bpw: float, max_error: float) -> None:
-    if not math.isfinite(target_bpw) or target_bpw <= 0:
-        raise ValueError("target_bpw must be finite and positive")
-    if not math.isfinite(max_error) or max_error < 0:
-        raise ValueError("max_error must be finite and nonnegative")
 
 
 def optimize_weight(
