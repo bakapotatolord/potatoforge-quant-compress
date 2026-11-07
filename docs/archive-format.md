@@ -28,6 +28,8 @@ Every tensor record contains `name`, reconstructed `dtype` and `shape`, `family`
 | `stored` | Original dtype and shape | Read the native storage bytes directly |
 | `deflate` | `U8[stored_bytes]` | Inflate raw DEFLATE with a window setting of `-15`, then interpret as `I8` with the manifest shape |
 
+The legacy `zlib_level` field is the v1 compression preset, fixed at 3. The writer uses level 3 for both zlib and the optional libdeflate encoder. Encoder choice is reported by the compression CLI. Readers use `codec` and `stored_bytes` to read the actual stream.
+
 `storage` distinguishes `unchanged` native tensors, `encoded_int8` weights that reconstruct the source codes exactly, and `optimized_int8` members of a fitted pair. A fitted weight uses `deflate` and its FP32 scale uses `stored`.
 
 Each family record contains `family` and `fit`. The descriptor in `family` gives `weight`, `scale`, `marker`, `format`, `status`, `reason`, and `group_size`. `fit` is `null` for protected, unsupported, and malformed families. For an eligible family it records `multiplier`, `baseline_weight_bytes`, `baseline_scale_bytes`, `payload_bpw`, `all_in_bpw`, `rate_target_missed`, `added_relative_sse`, `baseline_reference_error`, and `optimized_reference_error`. Multiplier 1.0 records an exact numerical baseline. BF16 error fields are `null` for quantized-only fitting. These statistics describe the fit and are independent of the decoder.

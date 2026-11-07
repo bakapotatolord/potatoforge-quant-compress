@@ -15,7 +15,7 @@ from .decoder import (
     MAX_MANIFEST_BYTES, MAX_TENSOR_BYTES, MAX_TENSORS, _require, _validate_settings, open_archive,
 )
 from .formats import classify_families, tensor_family
-from .optimize import MemberSize, Optimization, encoded_chunks, optimize_weight
+from .optimize import MemberSize, Optimization, encoded_chunks, optimize_weight, validate_optimizer_options
 from .safetensors_io import Checkpoint, TensorInfo, atomic_output, read_chunks, safetensors_header, tensor_alignment
 
 
@@ -34,10 +34,11 @@ def ordinary_checkpoint(path: Path | str) -> Checkpoint:
     return checkpoint
 
 
-def _stage_tensor(staged: BinaryIO, record: dict, values, measured: MemberSize) -> int:
+def _stage_tensor(staged: BinaryIO, record: dict, values, measured: MemberSize, encoded=None) -> int:
     raw = memoryview(values).cast("B")
     start = staged.tell()
-    for chunk in encoded_chunks(values, measured.codec):
+    chunks = encoded_chunks(values, measured.codec) if encoded is None else (encoded,)
+    for chunk in chunks:
         staged.write(chunk)
     size = staged.tell() - start
     _require(
@@ -65,6 +66,7 @@ def _fit_record(result: Optimization) -> dict:
 def compress_checkpoint(
     source: Path | str, output: Path | str, *, target_bpw: float, max_error: float,
     protect: tuple[str, ...] = (), reference: Path | str | None = None, force: bool = False,
+    encoder: str = "zlib", search: str = "batch-major",
 ) -> dict:
     source, output = Path(source), Path(output)
     inputs = (source,) if reference is None else (source, Path(reference))
@@ -73,6 +75,7 @@ def compress_checkpoint(
         "reference_mode": "quantized-only" if reference is None else "bf16",
     }
     _validate_settings(settings)
+    validate_optimizer_options(encoder, search)
     started = perf_counter()
     with atomic_output(output, force=force, inputs=inputs) as temporary:
         checkpoint = ordinary_checkpoint(source)
@@ -93,6 +96,7 @@ def compress_checkpoint(
             for name, tensor in checkpoint.tensors.items()
         }
         family_records = {}
+        encoder_counts = {}
         # Only encoded weights and changed scales need staging before the safetensors header is known.
         staged_offsets = {}
         with TemporaryFile(mode="w+b", dir=output.parent, prefix=".pfqc-", suffix=".tmp") as staged:
@@ -103,16 +107,20 @@ def compress_checkpoint(
                 _LOG.info("Fitting %r", name)
                 fit = optimize_weight(
                     checkpoint, name, target_bpw=target_bpw, max_error=max_error, protect=protect, reference=bf16,
+                    encoder=encoder, search=search,
                 )
                 _require(fit is not None, f"Source family changed while reading {name!r}")
                 family_records[name]["fit"] = _fit_record(fit)
+                encoder_counts[fit.encoder] = encoder_counts.get(fit.encoder, 0) + 1
                 modified = fit.selected.multiplier != 1
                 for key, values, size in (
                     (name, fit.codes, fit.selected.weight), (family.scale, fit.scales, fit.selected.scale),
                 ):
                     encoded = size.codec == "deflate"
                     if encoded or modified:
-                        staged_offsets[key] = _stage_tensor(staged, tensors[key], values, size)
+                        staged_offsets[key] = _stage_tensor(
+                            staged, tensors[key], values, size, fit.encoded_weight if key == name else None,
+                        )
                     if modified:
                         tensors[key]["storage"] = "optimized_int8"
                     elif encoded:
@@ -162,6 +170,7 @@ def compress_checkpoint(
             operation="compress", encode_seconds=encode_seconds, decode_verify_seconds=perf_counter() - encoded_at,
             encode_mib_per_second=report["source_bytes"] / (encode_seconds * 2**20),
             checksums_verified=True,
+            search=search, requested_encoder=encoder, encoder_counts=encoder_counts,
         )
     return report
 

@@ -44,6 +44,7 @@ class CLITests(unittest.TestCase):
     def test_cli_workflow_reports_rates_and_distinguishes_verification(self):
         output, _ = self.invoke(self.compress + ["--report", str(self.report)])
         self.assertIn("1 rate-target miss", output)
+        self.assertIn("Target 1.000 bpw missed for 1 of 1 eligible weights", output)
         report = json.loads(self.report.read_text(encoding="utf-8"))
         self.assertEqual(report["rate_target_misses"], 1)
         self.assertTrue(report["checksums_verified"])

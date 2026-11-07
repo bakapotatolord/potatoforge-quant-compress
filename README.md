@@ -31,7 +31,9 @@ The detector preserves conventional embedding and expert names, marked expert ba
 
 The scale grid runs from 1.0 to 2.0. The original pair is an exact baseline. Other trials widen FP32 row scales, round ties to even, and clamp codes to `[-128, 127]`. The optimizer measures level-3 DEFLATE for weight codes and prices scales at their native FP32 size. An eligible baseline can be encoded losslessly when its compressed stream is smaller. Protected and unsupported tensors are copied natively with their original names, shapes, dtypes, and bytes.
 
-The optimizer keeps the least-distorting candidate that meets the target and saves bytes. If the target is missed, it keeps the smallest candidate within the cap that saves bytes, or preserves the original pair.
+The optimizer keeps the least-distorting candidate that meets the target and saves bytes. If the target is missed, it keeps the smallest candidate within the cap that saves bytes, or preserves the original pair. The CLI reports how many eligible weights missed the target. A verified best-effort archive is still written.
+
+The default search evaluates the scale grid in row batches with zlib. For comparisons, use `--search reference` to run the original serial zlib search. Use `--encoder libdeflate` to try the optional accelerated raw DEFLATE encoder. It uses the bundled Windows x64 library on weights up to 64 MiB and falls back to zlib when the library is unavailable or a weight is larger. The compressor bounds the native candidate and output buffers and reports the encoder used per weight in aggregate. Both encoders write PFQC v1 archives. Their measured stream sizes can differ, which can change which candidate wins at a given bitrate.
 
 ## Verification
 

@@ -82,6 +82,15 @@ def _print_archive_report(report: dict, output: Path | None, verbose: bool) -> N
                 f"{report['payload_bpw']:.3f} weight payload bpw, {report['all_in_bpw']:.3f} bpw with scales, "
                 f"{report['rate_target_misses']:,} rate-target misses"
             )
+        if report["rate_target_misses"]:
+            print(
+                f"Target {report['settings']['target_bpw']:.3f} bpw missed for "
+                f"{report['rate_target_misses']:,} of {report['eligible_family_count']:,} eligible weights. "
+                "Best admissible results were written."
+            )
+        if report["encoder_counts"]:
+            encoders = ", ".join(f"{name}: {count:,}" for name, count in sorted(report["encoder_counts"].items()))
+            print(f"Fit encoders per weight ({encoders})")
         if report["max_added_relative_sse"] is not None:
             print(
                 f"Added relative SSE {report['mean_added_relative_sse']:.6g} mean, "
@@ -177,6 +186,9 @@ def main(argv: list[str] | None = None) -> int:
         help="Per-tensor added relative squared error cap (default %(default)s)",
     )
     compress.add_argument("--method", choices=[METHOD], default=METHOD)
+    compress.add_argument("--encoder", choices=["zlib", "libdeflate"], default="zlib", help="Raw DEFLATE encoder")
+    compress.add_argument("--search", choices=["batch-major", "reference"], default="batch-major",
+                          help="Exhaustive evaluation order. Reference search uses zlib.")
     compress.add_argument("--protect", action="append", default=[], metavar="PREFIX", help="Protect a logical weight prefix")
     compress.add_argument("--reference", type=Path, help="Optional original BF16 checkpoint")
     compress.add_argument("--output", type=Path, help="Defaults to <model>.pfqc.safetensors")
@@ -211,6 +223,7 @@ def main(argv: list[str] | None = None) -> int:
             report = compress_checkpoint(
                 args.model, output, target_bpw=args.target_bpw, max_error=args.max_error,
                 protect=tuple(args.protect), reference=args.reference, force=args.force,
+                encoder=args.encoder, search=args.search,
             )
         elif args.command == "decompress":
             report = decompress_archive(
