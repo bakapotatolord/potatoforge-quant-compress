@@ -36,10 +36,12 @@ Each family record contains `family` and `fit`. The descriptor in `family` gives
 
 1. Open the file with a safetensors reader and parse the reserved metadata string. Require the format and schema version above. Match the physical tensor keys to the logical tensor records.
 2. Validate dtypes, shapes, lengths, and codecs. Read each `stored` tensor as raw little-endian row-major storage. For `deflate`, read the U8 vector as bytes and inflate it as one bounded raw DEFLATE stream. Require end of stream, exactly `decoded_bytes` of output, and consumption of the full input.
-3. Check SHA-256 of each decoded byte sequence. Use the manifest dtype and shape for reconstructed weights, and load native scales and markers under the original keys. BF16-guided files include the final codes and scales needed for decoding.
+3. Check SHA-256 of each decoded byte sequence by default. Use the manifest dtype and shape for reconstructed weights, and load native scales and markers under the original keys. BF16-guided files include the final codes and scales needed for decoding.
 4. When writing a checkpoint, use the original metadata map and manifest tensor order. Emit an eight-byte little-endian safetensors header length, JSON padded with ASCII spaces to a multiple of eight, and tensor bodies with contiguous offsets. The CLI validates the closed temporary file with `safetensors.safe_open` before publishing it.
 
 The CLI bounds the manifest to 16 MiB and accepts up to 50,000 tensors, 64 GiB per tensor, and 256 GiB of total decoded tensor data. It checks rank and byte alignment, DEFLATE ratios up to 1,100:1, decoded lengths and hashes, and quantization-family consistency. Tensor names are keys and are never used as filesystem paths. The decoder uses chunks of at most 256 KiB.
+
+`open_archive(path, verify_checksums=False)` skips comparing SHA-256 digests when reading tensors. Manifest and family validation, decoded size limits, and end-of-stream checks still apply. `Archive.check_integrity()` always checks every tensor's SHA-256. The manifest requires the same checksum fields in either mode.
 
 Compression stages encoded weights and fitted scales on disk until the header is known. Other tensors stream from the input. The archived tensor records and physical tensor layout are deterministic for identical input, options, and runtime versions.
 

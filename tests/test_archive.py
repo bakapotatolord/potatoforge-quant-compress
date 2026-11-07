@@ -245,9 +245,21 @@ class ArchiveTests(unittest.TestCase):
             with self.subTest(damage=damage), self.assertRaisesRegex(ValueError, message):
                 self.write_v1_fixture(damage=damage)
                 verify_archive(self.archive)
+            with self.subTest(damage=damage, verify_checksums=False):
+                with self.assertRaisesRegex(ValueError, message):
+                    decompress_archive(self.archive, self.restored, verify_checksums=False)
+                self.assertFalse(self.restored.exists())
         self.write_v1_fixture(signed_payload=True)
         with self.assertRaisesRegex(ValueError, "Invalid U8 DEFLATE payload"):
             verify_archive(self.archive)
+
+    def test_check_integrity_still_verifies_an_archive_opened_without_checksums(self):
+        self.write_v1_fixture()
+        rewrite_manifest(self.archive, self.bad, lambda manifest: manifest["tensors"][0].update(sha256="0" * 64))
+        with open_archive(self.bad, verify_checksums=False) as archive:
+            self.assertEqual(len(b"".join(archive.chunks(WEIGHT))), archive.tensors[WEIGHT].nbytes)
+            with self.assertRaisesRegex(ValueError, "Checksum mismatch"):
+                archive.check_integrity()
 
     def test_rejects_encoded_protected_weight_and_duplicate_logical_names(self):
         self.write_v1_fixture()

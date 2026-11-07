@@ -17,6 +17,8 @@ uv run pf-compress decompress .\model.pfqc.safetensors --output .\restored.safet
 
 `uv run pf-compress decompress .\model.pfqc.safetensors` defaults to `.\model.safetensors`. Use `--output` to write beside the original or `--force` to replace an existing destination. A renamed compressed file defaults to `<name>.restored.safetensors`. The CLI detects archives from their metadata.
 
+`compress` verifies the completed archive before publishing it, including every tensor's SHA-256. `verify` performs the same integrity checks on an existing archive. `decompress` verifies checksums by default. Pass `--skip-checksums` to omit SHA-256 comparison while keeping manifest validation, tensor-size checks, and DEFLATE stream validation. This mode can accept altered tensor bytes if the archive and stream remain structurally valid.
+
 Use `--report .\compression.json` to save tensor sizes, achieved rates, error measurements, elapsed times, and peak process RSS where available. `--verbose` shows per-family fitting progress and results.
 
 ## Eligibility and distortion

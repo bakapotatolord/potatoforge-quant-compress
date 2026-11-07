@@ -11,7 +11,7 @@ import unittest
 import numpy as np
 from safetensors import safe_open
 
-from fixtures import family, save_fixture
+from fixtures import family, rewrite_manifest, save_fixture
 from pf_quant_compress.cli import main
 
 
@@ -81,6 +81,22 @@ class CLITests(unittest.TestCase):
             second.pop(key)
         self.assertEqual(first, second)
         self.assertEqual(list(second), sorted(second))
+
+    def test_decompress_skips_checksums_only_when_requested(self):
+        self.invoke(self.compress)
+        altered = self.folder / "altered.pfqc.safetensors"
+        rewrite_manifest(self.archive, altered, lambda manifest: manifest["tensors"][0].update(sha256="0" * 64))
+        args = ["decompress", str(altered), "--output", str(self.restored)]
+        _, error = self.invoke(args, expected=1)
+        self.assertIn("Checksum mismatch", error)
+        self.assertFalse(self.restored.exists())
+        _, error = self.invoke(["verify", str(altered)], expected=1)
+        self.assertIn("Checksum mismatch", error)
+
+        output, _ = self.invoke(args + ["--skip-checksums", "--report", str(self.report)])
+        self.assertIn("Skipped decoded tensor SHA-256 checks", output)
+        self.assertFalse(json.loads(self.report.read_text(encoding="utf-8"))["checksums_verified"])
+        self.assertTrue(self.restored.is_file())
 
     def test_cli_rejects_bad_arguments_and_paths_without_output(self):
         invalid = [

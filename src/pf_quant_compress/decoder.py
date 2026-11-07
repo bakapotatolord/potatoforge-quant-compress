@@ -65,8 +65,8 @@ def _validate_settings(settings: dict) -> None:
 
 
 @contextmanager
-def open_archive(path: Path | str) -> Iterator["Archive"]:
-    yield Archive(Checkpoint(path))
+def open_archive(path: Path | str, *, verify_checksums: bool = True) -> Iterator["Archive"]:
+    yield Archive(Checkpoint(path), verify_checksums=verify_checksums)
 
 
 def _inflate(
@@ -98,10 +98,11 @@ def _inflate(
 
 
 class Archive:
-    """Validated PFQC index. Exhaust tensor iterators to check their checksums."""
+    """Validated PFQC index. Exhaust tensor iterators to finish validation."""
 
-    def __init__(self, container: Checkpoint):
+    def __init__(self, container: Checkpoint, *, verify_checksums: bool = True):
         self._container = container
+        self._verify_checksums = verify_checksums
         self.file_bytes = container.file_bytes
         text = (container.metadata or {}).get(METADATA_KEY)
         _require(text is not None, f"Missing PFQC compression metadata ({METADATA_KEY})")
@@ -199,6 +200,9 @@ class Archive:
         self.reconstructed_bytes = len(self.header) + offset
 
     def chunks(self, name: str, chunk_size: int = CHUNK_BYTES) -> Iterator[bytes]:
+        return self._chunks(name, chunk_size, self._verify_checksums)
+
+    def _chunks(self, name: str, chunk_size: int, verify_checksums: bool) -> Iterator[bytes]:
         _require(type(chunk_size) is int and 0 < chunk_size <= CHUNK_BYTES, "Invalid tensor chunk size")
         record = self.records[name]
         size = record["decoded_bytes"]
@@ -206,14 +210,16 @@ class Archive:
             chunks = _inflate(self._container.chunks(name), size, chunk_size, name)
         else:
             chunks = self._container.chunks(name, chunk_size)
-        digest = sha256()
+        digest = sha256() if verify_checksums else None
         count = 0
         for chunk in chunks:
             count += len(chunk)
-            digest.update(chunk)
+            if digest is not None:
+                digest.update(chunk)
             yield chunk
         _require(count == size, f"Decoded size does not match for {name!r}")
-        _require(digest.hexdigest() == record["sha256"], f"Checksum mismatch for {name!r}")
+        if digest is not None:
+            _require(digest.hexdigest() == record["sha256"], f"Checksum mismatch for {name!r}")
 
     def validate_families(self) -> None:
         observed = classify_families(self, tuple(self.settings["protect"]))
@@ -295,7 +301,7 @@ class Archive:
     def check_integrity(self) -> None:
         self.validate_families()
         for name in self.tensors:
-            for _ in self.chunks(name):
+            for _ in self._chunks(name, CHUNK_BYTES, verify_checksums=True):
                 pass
 
     def report(self) -> dict:

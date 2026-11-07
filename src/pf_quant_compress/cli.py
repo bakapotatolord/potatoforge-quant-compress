@@ -104,7 +104,10 @@ def _print_archive_report(report: dict, output: Path | None, verbose: bool) -> N
     elif operation == "decompress":
         print(f"Reconstructed {report['tensor_count']:,} tensors to {output} ({_size(report['reconstructed_bytes'])})")
 
-    print(f"Verified decoded tensor checksums for {report['tensor_count']:,} tensors")
+    if report["checksums_verified"]:
+        print(f"Verified decoded tensor checksums for {report['tensor_count']:,} tensors")
+    else:
+        print("Skipped decoded tensor SHA-256 checks (--skip-checksums)")
     if operation == "verify" and report["reference_quantized_compared"]:
         print(f"{report['bit_identical_preserved_tensors']:,} preserved tensors match the quantized reference byte for byte")
         for fit in report["optimized_distortion"]:
@@ -180,6 +183,7 @@ def main(argv: list[str] | None = None) -> int:
     decompress = commands.add_parser("decompress", parents=[common], help="Reconstruct a standard safetensors file")
     decompress.add_argument("model", type=Path, metavar="archive")
     decompress.add_argument("--output", type=Path, help="Defaults to the checkpoint name without .pfqc")
+    decompress.add_argument("--skip-checksums", action="store_true", help="Skip decoded tensor SHA-256 checks")
     verify = commands.add_parser("verify", parents=[common], help="Verify archive structure and reconstructed bytes")
     verify.add_argument("model", type=Path, metavar="archive")
     verify.add_argument("--reference-quantized", type=Path, help="Compare against the original quantized checkpoint")
@@ -209,7 +213,9 @@ def main(argv: list[str] | None = None) -> int:
                 protect=tuple(args.protect), reference=args.reference, force=args.force,
             )
         elif args.command == "decompress":
-            report = decompress_archive(args.model, output, force=args.force)
+            report = decompress_archive(
+                args.model, output, force=args.force, verify_checksums=not args.skip_checksums,
+            )
         else:
             report = verify_archive(args.model, reference_quantized=args.reference_quantized)
 

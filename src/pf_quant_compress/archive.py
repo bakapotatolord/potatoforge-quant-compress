@@ -166,10 +166,15 @@ def compress_checkpoint(
     return report
 
 
-def decompress_archive(source: Path | str, output: Path | str, *, force: bool = False) -> dict:
+def decompress_archive(
+    source: Path | str, output: Path | str, *, force: bool = False, verify_checksums: bool = True,
+) -> dict:
     source, output = Path(source), Path(output)
     started = perf_counter()
-    with open_archive(source) as packed, atomic_output(output, force=force, inputs=(source,)) as temporary:
+    with (
+        open_archive(source, verify_checksums=verify_checksums) as packed,
+        atomic_output(output, force=force, inputs=(source,)) as temporary,
+    ):
         packed.validate_families()
         with temporary.open("wb") as stream:
             stream.write(packed.header)
@@ -181,7 +186,7 @@ def decompress_archive(source: Path | str, output: Path | str, *, force: bool = 
         report = packed.report()
         decode_seconds = perf_counter() - started
         report.update(
-            operation="decompress", decode_seconds=decode_seconds, checksums_verified=True,
+            operation="decompress", decode_seconds=decode_seconds, checksums_verified=verify_checksums,
             decode_mib_per_second=report["reconstructed_bytes"] / (decode_seconds * 2**20),
         )
     return report
