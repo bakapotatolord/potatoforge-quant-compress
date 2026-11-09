@@ -1,26 +1,24 @@
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from hashlib import sha256
+from itertools import islice
 import json
-import logging
 from pathlib import Path
 from tempfile import TemporaryFile
 from time import perf_counter
-from typing import BinaryIO
+from typing import BinaryIO, Callable
 
 from safetensors import safe_open
 
 from . import __version__
 from .decoder import (
-    Archive, DEFLATE_LEVEL, FORMAT, METADATA_KEY, METHOD, SCHEMA_VERSION, MAX_DECODED_BYTES,
-    MAX_MANIFEST_BYTES, MAX_TENSOR_BYTES, MAX_TENSORS, SCALE_MULTIPLIERS, WIDE_SCHEMA_VERSION,
+    Archive, ZSTD_LEVEL, FORMAT, METADATA_KEY, METHOD, SCHEMA_VERSION, MAX_DECODED_BYTES,
+    MAX_MANIFEST_BYTES, MAX_TENSOR_BYTES, MAX_TENSORS,
     _require, _validate_settings, open_archive,
 )
 from .formats import classify_families, tensor_family
 from .optimize import MemberSize, Optimization, encoded_chunks, optimize_weight, validate_optimizer_options
 from .safetensors_io import Checkpoint, TensorInfo, atomic_output, read_chunks, safetensors_header, tensor_alignment
-
-
-_LOG = logging.getLogger(__name__)
 
 
 def has_compression_metadata(checkpoint: Checkpoint) -> bool:
@@ -35,11 +33,10 @@ def ordinary_checkpoint(path: Path | str) -> Checkpoint:
     return checkpoint
 
 
-def _stage_tensor(staged: BinaryIO, record: dict, values, measured: MemberSize, encoded=None) -> int:
+def _stage_tensor(staged: BinaryIO, record: dict, values, measured: MemberSize) -> int:
     raw = memoryview(values).cast("B")
     start = staged.tell()
-    chunks = encoded_chunks(values, measured.codec) if encoded is None else (encoded,)
-    for chunk in chunks:
+    for chunk in encoded_chunks(values, measured.codec):
         staged.write(chunk)
     size = staged.tell() - start
     _require(
@@ -67,7 +64,7 @@ def _fit_record(result: Optimization) -> dict:
 def compress_checkpoint(
     source: Path | str, output: Path | str, *, target_bpw: float, max_error: float,
     protect: tuple[str, ...] = (), reference: Path | str | None = None, force: bool = False,
-    encoder: str = "zlib", search: str = "batch-major", wide_grid: bool = False,
+    search: str = "batch-major", wide_grid: bool = False, progress: Callable[[str], None] | None = None,
 ) -> dict:
     source, output = Path(source), Path(output)
     inputs = (source,) if reference is None else (source, Path(reference))
@@ -76,7 +73,7 @@ def compress_checkpoint(
         "reference_mode": "quantized-only" if reference is None else "bf16",
     }
     _validate_settings(settings)
-    validate_optimizer_options(encoder, search, wide_grid, max_error)
+    validate_optimizer_options(search, wide_grid, max_error)
     started = perf_counter()
     with atomic_output(output, force=force, inputs=inputs) as temporary:
         checkpoint = ordinary_checkpoint(source)
@@ -88,6 +85,13 @@ def compress_checkpoint(
             "Source exceeds the decoded size limits",
         )
         families = classify_families(checkpoint, protect)
+        eligible_count = sum(family.status == "eligible" for family in families.values())
+        eligible_index = 0
+        eligible_bytes = sum(
+            checkpoint.tensors[name].nbytes + checkpoint.tensors[family.scale].nbytes
+            for name, family in families.items() if family.status == "eligible"
+        )
+        processed_bytes = stored_bytes = 0
         tensors = {
             name: {
                 "name": name, "dtype": tensor.dtype, "shape": tensor.shape,
@@ -97,44 +101,62 @@ def compress_checkpoint(
             for name, tensor in checkpoint.tensors.items()
         }
         family_records = {}
-        encoder_counts = {}
-        fit_encoders = {}
         schema_version = SCHEMA_VERSION
         # Only encoded weights and changed scales need staging before the safetensors header is known.
         staged_offsets = {}
-        with TemporaryFile(mode="w+b", dir=output.parent, prefix=".pfqc-", suffix=".tmp") as staged:
+        with (TemporaryFile(mode="w+b", dir=output.parent, prefix=".pfqc-", suffix=".tmp") as staged,
+              ThreadPoolExecutor(max_workers=2) as executor):
+            eligible = iter(name for name, family in families.items() if family.status == "eligible")
+
+            def submit(name):
+                return executor.submit(
+                    optimize_weight, checkpoint, name, target_bpw=target_bpw, max_error=max_error,
+                    protect=protect, reference=bf16, search=search, wide_grid=wide_grid,
+                )
+
+            pending = {name: submit(name) for name in islice(eligible, 2)}
             for name, family in families.items():
                 family_records[name] = {"family": asdict(family), "fit": None}
                 if family.status != "eligible":
                     continue
-                _LOG.info("Fitting %r", name)
-                fit = optimize_weight(
-                    checkpoint, name, target_bpw=target_bpw, max_error=max_error, protect=protect, reference=bf16,
-                    encoder=encoder, search=search, wide_grid=wide_grid,
-                )
+                eligible_index += 1
+                if progress:
+                    progress(f"Compressing layer {eligible_index}/{eligible_count}: {name}")
+                fit = pending.pop(name).result()
                 _require(fit is not None, f"Source family changed while reading {name!r}")
                 family_records[name]["fit"] = _fit_record(fit)
-                encoder_counts[fit.encoder] = encoder_counts.get(fit.encoder, 0) + 1
-                fit_encoders[name] = fit.encoder
-                if fit.encoder != encoder:
-                    _LOG.info("Used %s fallback for %r", fit.encoder, name)
-                if fit.selected.multiplier not in SCALE_MULTIPLIERS:
-                    schema_version = WIDE_SCHEMA_VERSION
                 modified = fit.selected.multiplier != 1
                 for key, values, size in (
                     (name, fit.codes, fit.selected.weight), (family.scale, fit.scales, fit.selected.scale),
                 ):
-                    encoded = size.codec == "deflate"
+                    encoded = size.codec == "zstd"
                     if encoded or modified:
                         staged_offsets[key] = _stage_tensor(
-                            staged, tensors[key], values, size, fit.encoded_weight if key == name else None,
+                            staged, tensors[key], values, size,
                         )
                     if modified:
                         tensors[key]["storage"] = "optimized_int8"
                     elif encoded:
                         tensors[key]["storage"] = "encoded_int8"
+                if progress:
+                    original_bytes = checkpoint.tensors[name].nbytes + checkpoint.tensors[family.scale].nbytes
+                    processed_bytes += original_bytes
+                    stored_bytes += fit.selected.total_bytes
+                    progress(
+                        f"Finished layer {eligible_index}/{eligible_count}: {name} "
+                        f"(weight + scale: {original_bytes / 10**6:.2f} -> {fit.selected.total_bytes / 10**6:.2f} MB)"
+                    )
+                    progress(
+                        f"Total processed: {processed_bytes / 10**6:.2f} / {eligible_bytes / 10**6:.2f} MB; "
+                        f"compressed so far: {stored_bytes / 10**6:.2f} MB"
+                    )
                 del fit, values
+                next_name = next(eligible, None)
+                if next_name is not None:
+                    pending[next_name] = submit(next_name)
 
+            if progress:
+                progress("Writing compressed checkpoint...")
             staged_bytes = staged.tell()
             for name, record in tensors.items():
                 if name not in staged_offsets:
@@ -144,7 +166,7 @@ def compress_checkpoint(
                     record.update(sha256=digest.hexdigest(), stored_bytes=record["decoded_bytes"], codec="stored")
             manifest = {
                 "format": FORMAT, "schema_version": schema_version, "compressor_version": __version__,
-                "source_format": "safetensors", "method": METHOD, "zlib_level": DEFLATE_LEVEL,
+                "source_format": "safetensors", "method": METHOD, "zstd_level": ZSTD_LEVEL,
                 "settings": settings, "metadata": checkpoint.metadata, "source_bytes": checkpoint.file_bytes,
                 "tensors": list(tensors.values()), "families": family_records,
             }
@@ -153,7 +175,7 @@ def compress_checkpoint(
             physical = {}
             for name, record in tensors.items():
                 size = record["stored_bytes"]
-                if record["codec"] == "deflate":
+                if record["codec"] == "zstd":
                     physical[name] = TensorInfo("U8", (size,), 0, size)
                 else:
                     physical[name] = checkpoint.tensors[name]
@@ -171,19 +193,18 @@ def compress_checkpoint(
                         stream.write(chunk)
 
         encoded_at = perf_counter()
+        if progress:
+            progress("Verifying compressed checkpoint...")
         with open_archive(temporary) as packed:
             packed.check_integrity()
             report = packed.report()
-        for family in report["families"]:
-            if family["weight"] in fit_encoders:
-                family["encoder"] = fit_encoders[family["weight"]]
         encode_seconds = encoded_at - started
         report.update(
             operation="compress", encode_seconds=encode_seconds, decode_verify_seconds=perf_counter() - encoded_at,
             encode_mib_per_second=report["source_bytes"] / (encode_seconds * 2**20),
             checksums_verified=True,
             peak_temporary_file_bytes=staged_bytes + report["archive_bytes"],
-            search=search, wide_grid=wide_grid, requested_encoder=encoder, encoder_counts=encoder_counts,
+            search=search, wide_grid=wide_grid,
         )
     return report
 

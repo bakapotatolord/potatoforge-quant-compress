@@ -1,14 +1,14 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
-import zlib
 
 import numpy as np
 from safetensors import safe_open
 
 from fixtures import H4, bf16_bits, mixed_checkpoint, rewrite_manifest, save_fixture
 from pf_quant_compress.archive import compress_checkpoint, decompress_archive
-from pf_quant_compress.optimize import optimize_weight
+from pf_quant_compress.optimize import optimize_weight, rows_per_batch
+from pf_quant_compress.zstd import decompress_into
 from pf_quant_compress.safetensors_io import Checkpoint
 from pf_quant_compress.verify import verify_archive
 
@@ -46,7 +46,7 @@ class RoundTripTests(unittest.TestCase):
     def test_roundtrip_preserves_metadata_and_every_passthrough_bit(self):
         source_bytes = self.source.read_bytes()
         source = Checkpoint(self.source)
-        settings = {"target_bpw": 5.2, "max_error": 0.003, "protect": PROTECT}
+        settings = {"target_bpw": 4.8, "max_error": 0.003, "protect": PROTECT}
         expected = optimize_weight(source, WEIGHT, **settings)
         self.assertGreater(expected.selected.multiplier, 1)
         report = compress_checkpoint(self.source, self.archive, **settings)
@@ -63,7 +63,9 @@ class RoundTripTests(unittest.TestCase):
         with safe_open(self.archive, framework="np") as reader:
             codes = reader.get_tensor(WEIGHT)
             self.assertEqual((codes.dtype, codes.ndim), (np.dtype("uint8"), 1))
-            self.assertEqual(zlib.decompress(codes.tobytes(), wbits=-15), expected.codes.tobytes())
+            decoded = bytearray(expected.codes.nbytes)
+            decompress_into([codes.tobytes()], decoded)
+            self.assertEqual(decoded, expected.codes.tobytes())
             np.testing.assert_array_equal(reader.get_tensor(SCALE), expected.scales)
         for name, tensor in source.tensors.items():
             if name in (WEIGHT, SCALE):
@@ -92,14 +94,14 @@ class RoundTripTests(unittest.TestCase):
             self.assertEqual(b"".join(restored.chunks(name)), array.tobytes(), name)
 
     def test_reference_verify_detects_differences_in_a_protected_scale(self):
-        compress_checkpoint(self.source, self.archive, target_bpw=5.2, max_error=0.003, protect=PROTECT)
+        compress_checkpoint(self.source, self.archive, target_bpw=4.8, max_error=0.003, protect=PROTECT)
         self.original["blocks.18.proj.weight_scale"][0, 0] *= np.float32(1.5)
         self.save_source()
         with self.assertRaisesRegex(ValueError, "blocks.18.proj.weight_scale"):
             verify_archive(self.archive, reference_quantized=self.source)
 
     def test_reference_verify_checks_the_measured_distortion_cap(self):
-        compress_checkpoint(self.source, self.archive, target_bpw=5.2, max_error=0.003, protect=PROTECT)
+        compress_checkpoint(self.source, self.archive, target_bpw=4.8, max_error=0.003, protect=PROTECT)
         edited = self.folder / "edited.pfqc.safetensors"
 
         def claim_no_error(manifest):
@@ -110,6 +112,26 @@ class RoundTripTests(unittest.TestCase):
         self.assertTrue(verify_archive(edited)["checksums_verified"])
         with self.assertRaisesRegex(ValueError, "distortion violates the cap"):
             verify_archive(edited, reference_quantized=self.source)
+
+    def test_reference_verification_matches_fit_at_strict_cap_across_batches(self):
+        self.assertEqual(rows_per_batch(4096), 16)
+        rng = np.random.default_rng(201)
+        self.original[WEIGHT] = np.clip(np.rint(rng.normal(0, 19, (96, 4096))), -128, 127).astype(np.int8)
+        self.original[SCALE] = rng.uniform(0.002, 0.01, (96, 1)).astype("<f4")
+        self.save_source()
+        source = Checkpoint(self.source)
+        fit = optimize_weight(source, WEIGHT, target_bpw=6.1, max_error=0.001, protect=PROTECT)
+        self.assertGreater(fit.selected.multiplier, 1)
+        cap = fit.selected.added_error
+        report = compress_checkpoint(self.source, self.archive, target_bpw=6.1, max_error=cap, protect=PROTECT)
+        selected = next(item for item in report["families"] if item["weight"] == WEIGHT)
+        self.assertEqual(selected["multiplier"], fit.selected.multiplier)
+        self.assertEqual(selected["added_relative_sse"], cap)
+        verified = verify_archive(self.archive, reference_quantized=self.source)
+        self.assertEqual(verified["optimized_distortion"][0]["relative_sse_vs_quantized"], cap)
+        tighter = optimize_weight(source, WEIGHT, target_bpw=6.1, max_error=np.nextafter(cap, 0), protect=PROTECT)
+        self.assertLessEqual(tighter.selected.added_error, np.nextafter(cap, 0))
+        self.assertNotEqual(tighter.selected.multiplier, fit.selected.multiplier)
 
     def test_bf16_guided_archive_decodes_after_both_inputs_are_gone(self):
         rng = np.random.default_rng(7)

@@ -2,16 +2,15 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
-import zlib
 
 import numpy as np
 
 from fixtures import H4, bf16_bits, family, mixed_checkpoint, save_fixture
 from pf_quant_compress.archive import compress_checkpoint
 from pf_quant_compress.decoder import open_archive
-from pf_quant_compress.native import libdeflate
+from pf_quant_compress.zstd import Compressor, decompress_into
 from pf_quant_compress.optimize import (
-    SCALE_MULTIPLIERS, _ReferenceCache, _measure_batch, _requantize, _rotate_bf16, encoded_chunks, optimize_weight,
+    SCALE_MULTIPLIERS, _measure_batch, _requantize, _rotate_bf16, encoded_chunks, optimize_weight,
 )
 from pf_quant_compress.safetensors_io import Checkpoint
 from pf_quant_compress.verify import verify_archive
@@ -40,7 +39,9 @@ class OptimizerTests(unittest.TestCase):
     def assert_encoded_bytes(self, array, member):
         stream = b"".join(encoded_chunks(array, member.codec))
         self.assertEqual(len(stream), member.nbytes)
-        decoded = zlib.decompress(stream, wbits=-15) if member.codec == "deflate" else stream
+        decoded = bytearray(array.nbytes) if member.codec == "zstd" else stream
+        if member.codec == "zstd":
+            decompress_into([stream], decoded)
         self.assertEqual(decoded, array.tobytes())
         return decoded
 
@@ -85,7 +86,8 @@ class OptimizerTests(unittest.TestCase):
         original = codes.astype(np.float64) * scales
 
         def stored_size(values):
-            return min(values.nbytes, len(zlib.compress(values.tobytes(), level=3, wbits=-15)))
+            compressor = Compressor()
+            return min(values.nbytes, len(compressor.compress(values.tobytes()) + compressor.flush()))
 
         baseline_bytes = stored_size(codes) + scales.nbytes
         valid = []
@@ -98,7 +100,7 @@ class OptimizerTests(unittest.TestCase):
             if error <= 0.003 and total_bytes < baseline_bytes:
                 valid.append((multiplier, error, total_bytes, 8 * weight_bytes / codes.size))
 
-        for target in (5.2, 1.0):
+        for target in (4.8, 1.0):
             with self.subTest(target=target):
                 result = optimize_weight(source, "linear.weight", target_bpw=target, max_error=0.003)
                 hits = [trial for trial in valid if trial[3] <= target]
@@ -139,75 +141,6 @@ class OptimizerTests(unittest.TestCase):
                         self.assertEqual(new.codes.tobytes(), old.codes.tobytes())
                         self.assertEqual(new.scales.tobytes(), old.scales.tobytes())
 
-    def test_libdeflate_unavailable_or_oversized_uses_zlib(self):
-        codes = np.tile(np.arange(-16, 16, dtype=np.int8), (6, 8))
-        source = self.write_source(codes, np.ones((len(codes), 1), dtype="<f4"))
-        options = dict(target_bpw=1, max_error=.001)
-        expected = optimize_weight(source, "linear.weight", **options)
-        for key, value in (("libdeflate", lambda: None), ("NATIVE_TENSOR_LIMIT", codes.nbytes - 1)):
-            with self.subTest(key=key), patch(f"pf_quant_compress.optimize.{key}", value):
-                fit = optimize_weight(source, "linear.weight", encoder="libdeflate", **options)
-                self.assertEqual(fit.encoder, "zlib")
-                self.assertEqual(fit.selected, expected.selected)
-
-    @unittest.skipUnless(libdeflate(), "Requires the bundled Windows x64 libdeflate")
-    def test_native_reference_cache_matches_uncached_multi_group_fit(self):
-        codes = np.random.default_rng(817).integers(-16, 16, (24, 1024), dtype=np.int8)
-        scales = np.full((len(codes), 1), .125, dtype="<f4")
-        source = self.write_source(codes, scales)
-        weights = codes * scales
-        guide = (weights.reshape(-1, 4) @ H4.T).reshape(codes.shape)
-        reference = self.write_reference(bf16_bits(guide))
-        settings = dict(target_bpw=4.3, max_error=.015, wide_grid=True, reference=reference, encoder="libdeflate")
-        with (
-            patch("pf_quant_compress.optimize._NATIVE_BUFFER_BUDGET", codes.nbytes * 4),
-            patch("pf_quant_compress.optimize._BATCH_WEIGHTS", 4096),
-            patch("pf_quant_compress.optimize._rotate_bf16", wraps=_rotate_bf16) as rotate,
-        ):
-            cached = optimize_weight(source, "linear.weight", **settings)
-            cached_calls = rotate.call_count
-            rotate.reset_mock()
-            with patch("pf_quant_compress.optimize._REFERENCE_CACHE_BUDGET", 0):
-                uncached = optimize_weight(source, "linear.weight", **settings)
-            uncached_calls = rotate.call_count
-            rotate.reset_mock()  # Release the BF16 file mappings held in recorded calls.
-            self.assertLess(cached_calls, uncached_calls)
-        self.assertEqual(cached.selected, uncached.selected)
-        self.assertEqual(cached.baseline, uncached.baseline)
-        self.assertEqual(cached.codes.tobytes(), uncached.codes.tobytes())
-        self.assertEqual(cached.scales.tobytes(), uncached.scales.tobytes())
-        self.assertEqual(cached.encoded_weight, uncached.encoded_weight)
-
-    def test_reference_cache_restores_fp64_exceptions_and_respects_budget(self):
-        bits = np.zeros((2, 256), dtype="<u2")
-        bits[:, :4] = [0x3f80, 0x3380, 0x8000, 0]
-        expected = _rotate_bf16(bits, 4).view(np.uint64)
-        with patch("pf_quant_compress.optimize._REFERENCE_CACHE_BUDGET", 1100):
-            cache = _ReferenceCache(bits, 4)
-        for _ in range(2):
-            for row in range(2):
-                rows = slice(row, row + 1)
-                np.testing.assert_array_equal(cache(rows).view(np.uint64), expected[rows])
-        self.assertGreater(cache.tiles[0][1].size, 0)
-        self.assertNotIn(1, cache.tiles)
-
-    @unittest.skipUnless(libdeflate(), "Requires the bundled Windows x64 libdeflate")
-    def test_libdeflate_winner_stream_is_written_and_read_by_zlib(self):
-        codes = np.random.default_rng(817).integers(-16, 16, (24, 1024), dtype=np.int8)
-        source = self.write_source(codes, np.full((len(codes), 1), .125, dtype="<f4"))
-        options = dict(target_bpw=1, max_error=.003, encoder="libdeflate")
-        fit = optimize_weight(source, "linear.weight", **options)
-        self.assertGreater(fit.selected.multiplier, 1)
-        self.assertEqual(len(fit.encoded_weight), fit.selected.weight.nbytes)
-        output = self.source.with_name("native.pfqc.safetensors")
-        report = compress_checkpoint(self.source, output, **options)
-        self.assertEqual(report["encoder_counts"], {"libdeflate": 1})
-        with open_archive(output) as archive:
-            self.assertEqual(archive.manifest["zlib_level"], 3)
-            self.assertEqual(b"".join(Checkpoint(output).chunks("linear.weight")), fit.encoded_weight)
-            self.assertEqual(b"".join(archive.chunks("linear.weight")), fit.codes.tobytes())
-            self.assertEqual(b"".join(archive.chunks("linear.weight_scale")), fit.scales.tobytes())
-
     def test_incompressible_with_zero_cap_uses_raw_and_exact_noop(self):
         codes = np.random.default_rng(523).integers(-128, 128, (17, 4096), dtype=np.int8)
         scales = np.full((17, 1), 0.125, dtype="<f4")
@@ -239,7 +172,7 @@ class OptimizerTests(unittest.TestCase):
         codes[1], scales[1, 0] = 3, 1.12e38
         self.assertTrue(np.isfinite(codes.astype(np.float32) * scales).all())
 
-        baseline_bpw = 8 * len(zlib.compress(codes.tobytes(), level=3, wbits=-15)) / codes.size
+        baseline_bpw = 8 * len(b"".join(encoded_chunks(codes, "zstd"))) / codes.size
         source = self.write_source(codes, scales)
         settings = {"target_bpw": baseline_bpw - 0.001, "max_error": 0.001}
         result = optimize_weight(source, "linear.weight", **settings)
@@ -308,7 +241,7 @@ class OptimizerTests(unittest.TestCase):
         reference = bf16_bits([[1] * 4, [2] * 4, [2] * 4])
         with patch("pf_quant_compress.optimize._BATCH_WEIGHTS", 4):
             # The first row adds squared error. The next two rows each remove it.
-            [(candidate, _)] = _measure_batch(codes, scales, reference, 4, (2.0,), None, None, 0.0)
+            [candidate] = _measure_batch(codes, scales, reference, 4, (2.0,), None, 0.0)
         self.assertEqual(candidate.added_error, 0.0)
         self.assertAlmostEqual(candidate.reference_error, 4 / 36)
 

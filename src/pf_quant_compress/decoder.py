@@ -1,17 +1,17 @@
 """Validate and reconstruct PFQC archives without compression or optimization."""
 
 from collections import Counter
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict
 from hashlib import sha256
 import math
 from pathlib import Path
 import sys
-import zlib
 
 from .formats import Family, classify_families, tensor_family
-from .native import NATIVE_TENSOR_LIMIT, inflate_into, libdeflate, sha256_hex
+from .native import sha256_hex
+from .zstd import ZSTD_LEVEL, decompress_chunks, decompress_into
 from .safetensors_io import (
     CHUNK_BYTES, MAX_HEADER_BYTES, Checkpoint, TensorInfo, read_json_object, safetensors_header, tensor_nbytes,
 )
@@ -20,20 +20,16 @@ from .safetensors_io import (
 FORMAT = "potatoforge_quant_compress"
 METADATA_KEY = FORMAT + ".manifest"
 SCHEMA_VERSION = 1
-WIDE_SCHEMA_VERSION = 2
 METHOD = "wider-scale"
 MAX_MANIFEST_BYTES = 16 * 2**20
 MAX_TENSORS = 50_000
 MAX_TENSOR_BYTES = 64 * 2**30
 MAX_DECODED_BYTES = 256 * 2**30
-MAX_DEFLATE_RATIO = 1100
 
-DEFLATE_LEVEL = 3
 SCALE_MULTIPLIERS = (1.0, 1.025, 1.05, 1.1, 1.2, 1.35, 1.5, 1.75, 2.0)
 WIDE_SCALE_MULTIPLIERS = SCALE_MULTIPLIERS + (
     2.5, 3.0, 4.0, 6.0, 8.0, 10.0, 12.0, 12.5, 13.0, 13.5, 14.0,
 )
-_LEGACY_WIDE_MULTIPLIERS = WIDE_SCALE_MULTIPLIERS + (14.5, 15.0, 15.5, 16.0)
 
 
 def validate_limits(target_bpw: float, max_error: float) -> None:
@@ -75,34 +71,6 @@ def open_archive(path: Path | str, *, verify_checksums: bool = True) -> Iterator
     yield Archive(Checkpoint(path), verify_checksums=verify_checksums)
 
 
-def _inflate(
-    chunks: Iterable[bytes], decoded_bytes: int, chunk_size: int, name: str,
-) -> Iterator[bytes]:
-    decoder = zlib.decompressobj(wbits=-zlib.MAX_WBITS)
-    remaining = decoded_bytes
-    pending = bytearray()
-    try:
-        for compressed in chunks:
-            while True:
-                limit = min(chunk_size - len(pending), remaining + 1)
-                decoded = decoder.decompress(compressed, limit)
-                _require(len(decoded) <= remaining, f"Decoded size exceeds the declared length for {name!r}")
-                _require(not decoder.unused_data, f"Trailing DEFLATE data for {name!r}")
-                remaining -= len(decoded)
-                pending.extend(decoded)
-                if len(pending) == chunk_size:
-                    yield bytes(pending)
-                    pending.clear()
-                compressed = decoder.unconsumed_tail
-                if not compressed and len(decoded) < limit:
-                    break
-    except zlib.error as error:
-        raise ValueError(f"Invalid DEFLATE stream for {name!r}: {error}") from error
-    _require(decoder.eof and remaining == 0, f"Incomplete DEFLATE data or wrong decoded length for {name!r}")
-    if pending:
-        yield bytes(pending)
-
-
 class Archive:
     """Validated PFQC index. Exhaust tensor iterators to finish validation."""
 
@@ -125,14 +93,14 @@ class Archive:
         manifest = self.manifest
         _require(manifest.get("format") == FORMAT, "Unrecognized PFQC format")
         version = manifest.get("schema_version")
-        _require(type(version) is int and version in (SCHEMA_VERSION, WIDE_SCHEMA_VERSION),
+        _require(type(version) is int and version == SCHEMA_VERSION,
                  "Unsupported PFQC schema version")
         self.schema_version = version
         _require(
             isinstance(manifest.get("compressor_version"), str) and bool(manifest["compressor_version"])
             and manifest.get("source_format") == "safetensors"
             and manifest.get("method") == METHOD
-            and type(manifest.get("zlib_level")) is int and manifest["zlib_level"] == DEFLATE_LEVEL,
+            and type(manifest.get("zstd_level")) is int and manifest["zstd_level"] == ZSTD_LEVEL,
             "Invalid PFQC format settings",
         )
         self.settings = manifest.get("settings")
@@ -176,13 +144,12 @@ class Archive:
                     (physical.dtype, physical.shape, physical.nbytes) == (dtype, tuple(shape), nbytes),
                     f"Native tensor metadata does not match for {name!r}",
                 )
-            elif codec == "deflate":
+            elif codec == "zstd":
                 _require(
                     dtype == "I8" and len(shape) == 2 and physical.dtype == "U8"
                     and physical.shape == (physical.nbytes,) and 0 < physical.nbytes < nbytes,
-                    f"Invalid U8 DEFLATE payload for {name!r}",
+                    f"Invalid U8 Zstandard payload for {name!r}",
                 )
-                _require(nbytes <= physical.nbytes * MAX_DEFLATE_RATIO, f"Suspicious compression ratio for {name!r}")
             else:
                 raise ValueError(f"Unsupported tensor codec for {name!r}")
             digest = record.get("sha256")
@@ -218,33 +185,20 @@ class Archive:
             _require(sha256_hex(raw) == self.records[name]["sha256"], f"Checksum mismatch for {name!r}")
 
     def decode_into(self, name: str, output) -> None:
-        """Reconstruct a DEFLATE tensor into an exact-sized writable buffer."""
+        """Reconstruct a Zstandard tensor into an exact-sized writable buffer."""
         buffer = memoryview(output).cast("B")
         record = self.records[name]
-        _require(record["codec"] == "deflate", f"Expected a DEFLATE tensor for {name!r}")
+        _require(record["codec"] == "zstd", f"Expected a Zstandard tensor for {name!r}")
         _require(not buffer.readonly and len(buffer) == record["decoded_bytes"], f"Invalid output buffer for {name!r}")
-        library = libdeflate() if len(buffer) <= NATIVE_TENSOR_LIMIT else None
-        if library is None:
-            offset = 0
-            for chunk in self._chunks(name, CHUNK_BYTES, verify_checksums=False):
-                end = offset + len(chunk)
-                buffer[offset:end] = chunk
-                offset = end
-        else:
-            size = record["stored_bytes"]
-            with self._container.path.open("rb") as stream:
-                stream.seek(self._container.tensors[name].offset)
-                encoded = stream.read(size)
-            _require(len(encoded) == size, f"Truncated DEFLATE payload for {name!r}")
-            inflate_into(library, encoded, buffer, name)
+        decompress_into(self._container.chunks(name), buffer)
         self.check_tensor(name, buffer)
 
     def _chunks(self, name: str, chunk_size: int, verify_checksums: bool) -> Iterator[bytes]:
         _require(type(chunk_size) is int and 0 < chunk_size <= CHUNK_BYTES, "Invalid tensor chunk size")
         record = self.records[name]
         size = record["decoded_bytes"]
-        if record["codec"] == "deflate":
-            chunks = _inflate(self._container.chunks(name), size, chunk_size, name)
+        if record["codec"] == "zstd":
+            chunks = decompress_chunks(self._container.chunks(name), size, chunk_size)
         else:
             chunks = self._container.chunks(name, chunk_size)
         digest = sha256() if verify_checksums else None
@@ -277,7 +231,7 @@ class Archive:
             else:
                 _require(fit is None, f"Ineligible or protected family {name!r} has a fit record")
         for name, record in self.records.items():
-            encoded = record["codec"] == "deflate"
+            encoded = record["codec"] == "zstd"
             mode = "encoded_int8" if encoded else "unchanged"
             if name in modified:
                 mode = "optimized_int8"
@@ -295,7 +249,7 @@ class Archive:
         )
         weight, scale = self.records[name], self.records[family.scale]
         multiplier, error = fit.get("multiplier"), fit.get("added_relative_sse")
-        allowed = _LEGACY_WIDE_MULTIPLIERS if self.schema_version == SCHEMA_VERSION else WIDE_SCALE_MULTIPLIERS
+        allowed = WIDE_SCALE_MULTIPLIERS
         _require(
             _number(multiplier) and multiplier in allowed
             and _number(error) and 0 <= error <= self.settings["max_error"],
@@ -330,7 +284,7 @@ class Archive:
             )
             return False
         _require(
-            weight["codec"] == "deflate" and selected_total < baseline_weight + baseline_scale
+            weight["codec"] == "zstd" and selected_total < baseline_weight + baseline_scale
             and 8 * baseline_weight / weight_count > self.settings["target_bpw"],
             f"Optimized family {name!r} violates the baseline storage rule",
         )
@@ -377,7 +331,7 @@ class Archive:
         fitted_bytes = stored_weights + stored_scales
         optimized = len(multipliers)
         return {
-            "format": FORMAT, "schema_version": self.schema_version, "method": METHOD, "zlib_level": DEFLATE_LEVEL,
+            "format": FORMAT, "schema_version": self.schema_version, "method": METHOD, "zstd_level": ZSTD_LEVEL,
             "settings": self.settings, "tensor_count": len(self.records), "source_bytes": source_bytes,
             "archive_bytes": self.file_bytes, "reconstructed_bytes": self.reconstructed_bytes,
             "archive_fraction_of_source": self.file_bytes / source_bytes,
@@ -390,7 +344,7 @@ class Archive:
             "protected_family_count": counts["protected"], "unsupported_family_count": counts["unsupported"],
             "malformed_family_count": counts["malformed"], "skipped_family_count": counts["eligible"] - optimized,
             "preserved_tensor_count": len(self.records) - 2 * optimized,
-            "encoded_weight_count": sum(record["codec"] == "deflate" for record in self.records.values()),
+            "encoded_weight_count": sum(record["codec"] == "zstd" for record in self.records.values()),
             "rate_target_misses": misses,
             "payload_bpw": 8 * stored_weights / weights if weights else None,
             "all_in_bpw": 8 * fitted_bytes / weights if weights else None,

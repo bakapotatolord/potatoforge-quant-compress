@@ -43,6 +43,11 @@ class CLITests(unittest.TestCase):
 
     def test_cli_workflow_reports_rates_and_distinguishes_verification(self):
         output, _ = self.invoke(self.compress + ["--report", str(self.report)])
+        self.assertIn("Compressing layer 1/1: linear.weight", output)
+        self.assertRegex(output, r"Finished layer 1/1: linear\.weight \(weight \+ scale: 0\.02 -> \d+\.\d{2} MB\)")
+        self.assertRegex(output, r"Total processed: 0\.02 / 0\.02 MB; compressed so far: \d+\.\d{2} MB")
+        self.assertIn("Writing compressed checkpoint...", output)
+        self.assertIn("Verifying compressed checkpoint...", output)
         self.assertIn("1 rate-target miss", output)
         self.assertIn("Target 1.000 bpw missed for 1 of 1 eligible weights", output)
         report = json.loads(self.report.read_text(encoding="utf-8"))
@@ -84,7 +89,7 @@ class CLITests(unittest.TestCase):
         self.assertEqual(list(second), sorted(second))
 
     def test_wide_grid_is_opt_in_and_respects_error_cap(self):
-        args = self.compress + ["--target-bpw", "4.3", "--max-error", "0.015", "--report", str(self.report)]
+        args = self.compress + ["--target-bpw", "3.8", "--max-error", "0.015", "--report", str(self.report)]
         self.invoke(args)
         default = json.loads(self.report.read_text(encoding="utf-8"))
         self.assertEqual(default["schema_version"], 1)
@@ -93,7 +98,7 @@ class CLITests(unittest.TestCase):
 
         self.invoke(args + ["--wide-grid", "--force"])
         wide = json.loads(self.report.read_text(encoding="utf-8"))
-        self.assertEqual(wide["schema_version"], 2)
+        self.assertEqual(wide["schema_version"], 1)
         fit = wide["families"][0]
         self.assertTrue(wide["wide_grid"])
         self.assertFalse(fit["rate_target_missed"])
@@ -101,15 +106,6 @@ class CLITests(unittest.TestCase):
         self.assertLessEqual(fit["added_relative_sse"], 0.015)
         self.invoke(["verify", str(self.archive), "--reference-quantized", str(self.source)])
         self.invoke(["decompress", str(self.archive), "--output", str(self.restored)])
-
-        # V1 archives written during the wider-grid experiment remain readable.
-        legacy = self.folder / "legacy-wide.pfqc.safetensors"
-        def legacy_fit(manifest):
-            manifest.update(schema_version=1)
-            manifest["families"]["linear.weight"]["fit"].update(multiplier=16.0)
-
-        rewrite_manifest(self.archive, legacy, legacy_fit)
-        self.invoke(["verify", str(legacy)])
 
         altered = self.folder / "invalid-grid.pfqc.safetensors"
         rewrite_manifest(
@@ -147,7 +143,7 @@ class CLITests(unittest.TestCase):
     def test_cli_rejects_bad_arguments_and_paths_without_output(self):
         invalid = [
             self.compress[:4],
-            self.compress + ["--method", "other"],
+            self.compress + ["--method", "wider-scale"],
             ["decompress"],
         ]
         for args in invalid:

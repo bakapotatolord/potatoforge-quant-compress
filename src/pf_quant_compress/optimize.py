@@ -1,22 +1,16 @@
 from collections.abc import Iterator
-from contextlib import contextmanager
-import ctypes as ct
 from dataclasses import dataclass
-from typing import Any
-import zlib
 
 import numpy as np
 
-from .decoder import DEFLATE_LEVEL, SCALE_MULTIPLIERS, WIDE_SCALE_MULTIPLIERS, validate_limits
+from .decoder import SCALE_MULTIPLIERS, WIDE_SCALE_MULTIPLIERS, validate_limits
 from .formats import classify_weight
-from .native import NATIVE_TENSOR_LIMIT, libdeflate
+from .zstd import Compressor
 from .safetensors_io import Checkpoint, array_chunks
 
 
-_BATCH_WEIGHTS = 256 * 1024
+_BATCH_WEIGHTS = 64 * 1024
 _FP32_MAX = float(np.finfo(np.float32).max)
-_NATIVE_BUFFER_BUDGET = 256 * 2**20
-_REFERENCE_CACHE_BUDGET = 256 * 2**20
 DEFAULT_MAX_ERROR = 0.001
 
 
@@ -46,8 +40,6 @@ class Optimization:
     baseline: Candidate
     selected: Candidate
     target_bpw: float
-    encoded_weight: memoryview | None = None
-    encoder: str = "zlib"
 
     @property
     def payload_bpw(self) -> float:
@@ -62,54 +54,11 @@ class Optimization:
         return self.payload_bpw > self.target_bpw
 
 
-def _deflater():
-    return zlib.compressobj(DEFLATE_LEVEL, wbits=-zlib.MAX_WBITS)
-
-
-def validate_optimizer_options(encoder: str, search: str, wide_grid: bool, max_error: float) -> None:
-    if encoder not in ("zlib", "libdeflate"):
-        raise ValueError(f"Unsupported encoder {encoder!r}")
+def validate_optimizer_options(search: str, wide_grid: bool, max_error: float) -> None:
     if search not in ("batch-major", "reference"):
         raise ValueError(f"Unsupported search {search!r}")
-    if search == "reference" and encoder != "zlib":
-        raise ValueError("The reference search requires the zlib encoder")
     if wide_grid and max_error <= DEFAULT_MAX_ERROR:
         raise ValueError(f"The experimental wide grid requires max_error > {DEFAULT_MAX_ERROR:g}")
-
-
-@contextmanager
-def _native_encoder(enabled):
-    library = libdeflate() if enabled else None
-    if library is None:
-        yield None
-        return
-    try:
-        alloc = library.libdeflate_alloc_compressor
-        alloc.argtypes, alloc.restype = [ct.c_int], ct.c_void_p
-        free = library.libdeflate_free_compressor
-        free.argtypes, free.restype = [ct.c_void_p], None
-        compress = library.libdeflate_deflate_compress
-        compress.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_size_t, ct.c_void_p, ct.c_size_t]
-        compress.restype = ct.c_size_t
-    except AttributeError:
-        yield None
-        return
-    context = alloc(DEFLATE_LEVEL)
-    if not context:
-        yield None
-        return
-
-    def encode(array):
-        # A stream that cannot beat the raw size should be stored natively.
-        output = bytearray(array.nbytes - 1)
-        address = ct.addressof(ct.c_ubyte.from_buffer(output))
-        size = compress(context, array.ctypes.data, array.nbytes, address, len(output))
-        return memoryview(output)[:size] if size else None
-
-    try:
-        yield encode
-    finally:
-        free(context)
 
 
 def encoded_chunks(array: np.ndarray, codec: str) -> Iterator[bytes | memoryview]:
@@ -117,9 +66,9 @@ def encoded_chunks(array: np.ndarray, codec: str) -> Iterator[bytes | memoryview
     if codec == "stored":
         yield from array_chunks(array)
         return
-    if codec != "deflate":
+    if codec != "zstd":
         raise ValueError(f"Unsupported codec {codec!r}")
-    compressor = _deflater()
+    compressor = Compressor()
     for chunk in array_chunks(array):
         encoded = compressor.compress(chunk)
         if encoded:
@@ -127,9 +76,9 @@ def encoded_chunks(array: np.ndarray, codec: str) -> Iterator[bytes | memoryview
     yield compressor.flush()
 
 
-def _storage_size(deflated_bytes: int, raw_bytes: int) -> MemberSize:
-    if deflated_bytes < raw_bytes:
-        return MemberSize("deflate", deflated_bytes)
+def _storage_size(compressed_bytes: int, raw_bytes: int) -> MemberSize:
+    if compressed_bytes < raw_bytes:
+        return MemberSize("zstd", compressed_bytes)
     return MemberSize("stored", raw_bytes)
 
 
@@ -145,50 +94,6 @@ def _rotate_bf16(bits: np.ndarray, group_size: int) -> np.ndarray:
         stage[:] = stage.sum(axis=1, keepdims=True) * 0.5 - stage[:, ::-1, :]
         stride *= 4
     return rotated
-
-
-class _ReferenceCache:
-    """Keep compact reference tiles and only the FP64 values FP32 cannot represent exactly."""
-
-    def __init__(self, bits: np.ndarray, group_size: int):
-        self.bits = bits
-        self.group_size = group_size
-        self.tiles = {}
-        self.remaining = _REFERENCE_CACHE_BUDGET
-
-    def __call__(self, rows: slice) -> np.ndarray:
-        start = rows.start
-        tile = self.tiles.get(start)
-        if tile is not None:
-            compact, indices, exact = tile
-            try:
-                target = compact.astype(np.float64)
-                target.reshape(-1)[indices] = exact
-                return target
-            except MemoryError:
-                self.tiles.clear()
-                self.remaining = 0
-
-        target = _rotate_bf16(self.bits[rows], self.group_size)
-        if start in self.tiles or self.remaining < target.size * 4:
-            return target
-        try:
-            with np.errstate(over="ignore", under="ignore"):
-                compact = target.astype(np.float32)
-            restored = compact.astype(np.float64)
-            indices = np.flatnonzero(target.view(np.uint64) != restored.view(np.uint64)).astype(np.int32)
-            # Keep exception lists sparse so more tiles fit the cache budget.
-            exception_bytes = indices.size * 12
-            size = compact.nbytes + exception_bytes
-            if exception_bytes <= target.size and size <= self.remaining:
-                self.tiles[start] = (compact, indices, target.reshape(-1)[indices])
-                self.remaining -= size
-            else:
-                self.tiles[start] = None
-        except MemoryError:
-            self.tiles.clear()
-            self.remaining = 0
-        return target
 
 
 def _requantize(target: np.ndarray, codes: np.ndarray, scales: np.ndarray, multiplier: float):
@@ -215,7 +120,7 @@ def _row_slices(codes):
         yield slice(start, start + batch_rows)
 
 
-def _candidate_rows(codes, scales, reference, group_size, multiplier, cache=None):
+def _candidate_rows(codes, scales, reference, group_size, multiplier):
     for rows in _row_slices(codes):
         q0, s0 = codes[rows], scales[rows]
         if multiplier == 1.0 and reference is None:
@@ -223,9 +128,7 @@ def _candidate_rows(codes, scales, reference, group_size, multiplier, cache=None
             continue
 
         original = np.multiply(q0, s0, dtype=np.float64)
-        target = original if reference is None else (
-            _rotate_bf16(reference[rows], group_size) if cache is None else cache(rows)
-        )
+        target = original if reference is None else _rotate_bf16(reference[rows], group_size)
         q1, s1 = (q0, s0) if multiplier == 1.0 else _requantize(target, q0, s0, multiplier)
         yield rows, q1, s1, original, target
 
@@ -240,7 +143,7 @@ def introduces_fp32_overflow(original: np.ndarray, reconstructed: np.ndarray, sc
 
 
 def _measure(codes, scales, reference, group_size, multiplier) -> Candidate | None:
-    weight_stream = _deflater()
+    weight_stream = Compressor()
     weight_bytes = 0
     energy = error = added_sse = 0.0
 
@@ -275,8 +178,7 @@ def _measure(codes, scales, reference, group_size, multiplier) -> Candidate | No
 @dataclass(eq=False)
 class _Trial:
     multiplier: float
-    stream: Any = None
-    codes: np.ndarray | None = None
+    stream: Compressor
     weight_bytes: int = 0
     error: float = 0.0
     added_sse: float = 0.0
@@ -290,19 +192,13 @@ def _quantized_denominator(codes, scales):
     return max(energy, float(np.finfo(np.float64).tiny))
 
 
-def _measure_batch(codes, scales, reference, group_size, multipliers, encode, denominator, max_error, cache=None):
-    trials = [
-        _Trial(m, stream=_deflater()) if encode is None else
-        _Trial(m, codes=codes if m == 1.0 else np.empty_like(codes, subok=False))
-        for m in multipliers
-    ]
+def _measure_batch(codes, scales, reference, group_size, multipliers, denominator, max_error):
+    trials = [_Trial(m, Compressor()) for m in multipliers]
     energy = 0.0
     for rows in _row_slices(codes):
         q0, s0 = codes[rows], scales[rows]
         original = np.multiply(q0, s0, dtype=np.float64)
-        target = original if reference is None else (
-            _rotate_bf16(reference[rows], group_size) if cache is None else cache(rows)
-        )
+        target = original if reference is None else _rotate_bf16(reference[rows], group_size)
         if denominator is None:
             energy += float(np.sum(target * target))
         original_residual = None if reference is None else original - target
@@ -325,10 +221,7 @@ def _measure_batch(codes, scales, reference, group_size, multipliers, encode, de
             elif m != 1.0:
                 change = reconstructed - original
                 trial.added_sse += float(np.sum(change * (residual + original_residual)))
-            if trial.stream is not None:
-                trial.weight_bytes += sum(len(trial.stream.compress(chunk)) for chunk in array_chunks(q1))
-            elif m != 1.0:
-                trial.codes[rows] = q1
+            trial.weight_bytes += sum(len(trial.stream.compress(chunk)) for chunk in array_chunks(q1))
         if not trials:
             break
 
@@ -340,16 +233,11 @@ def _measure_batch(codes, scales, reference, group_size, multipliers, encode, de
         added_error = max(0.0, trial.error if reference is None else trial.added_sse) / denominator
         if added_error > max_error:
             continue
-        if trial.stream is None:
-            payload = encode(trial.codes)
-            weight_bytes = codes.nbytes if payload is None else len(payload)
-        else:
-            payload = None
-            weight_bytes = trial.weight_bytes + len(trial.stream.flush())
+        weight_bytes = trial.weight_bytes + len(trial.stream.flush())
         yield Candidate(
             trial.multiplier, _storage_size(weight_bytes, codes.nbytes), MemberSize("stored", scales.nbytes),
             added_error, trial.error / denominator if reference is not None else None,
-        ), payload
+        )
 
 
 def _rank(candidate: Candidate, weight_count: int, target_bpw: float) -> tuple:
@@ -367,13 +255,12 @@ def optimize_weight(
     max_error: float,
     protect: tuple[str, ...] = (),
     reference: Checkpoint | None = None,
-    encoder: str = "zlib",
     search: str = "batch-major",
     wide_grid: bool = False,
 ) -> Optimization | None:
     """Fit one supported family. None signals passthrough of the entire family."""
     validate_limits(target_bpw, max_error)
-    validate_optimizer_options(encoder, search, wide_grid, max_error)
+    validate_optimizer_options(search, wide_grid, max_error)
     family = classify_weight(checkpoint, weight, protect)
     if family.status != "eligible":
         return None
@@ -390,59 +277,32 @@ def optimize_weight(
         reference_bits = reference.array(weight)
 
     group_size = family.group_size
-    native_limit = min(NATIVE_TENSOR_LIMIT, _NATIVE_BUFFER_BUDGET // 4)
-    cache = None
-    with _native_encoder(encoder == "libdeflate" and codes.nbytes <= native_limit) as encode:
-        best_payload = None
-        try:
-            if encode is None:
-                baseline = _measure(codes, scales, reference_bits, group_size, 1.0)
-            elif reference_bits is None:
-                best_payload = encode(codes)
-                nbytes = codes.nbytes if best_payload is None else len(best_payload)
-                baseline = Candidate(1.0, _storage_size(nbytes, codes.nbytes), MemberSize("stored", scales.nbytes), 0.0, None)
-            else:
-                baseline, best_payload = next(_measure_batch(
-                    codes, scales, reference_bits, group_size, (1.0,), encode, None, max_error,
-                ))
-        except ValueError as error:
-            raise ValueError(f"{weight!r}: {error}") from error
-        assert baseline is not None
-        best = baseline
-        if 8 * baseline.weight.nbytes / codes.size > target_bpw:
-            max_scale = float(scales.max())
-            grid = WIDE_SCALE_MULTIPLIERS if wide_grid else SCALE_MULTIPLIERS
-            multipliers = tuple(m for m in grid[1:] if max_scale * m <= _FP32_MAX)
-            if search == "reference":
-                candidates = ((_measure(codes, scales, reference_bits, group_size, m), None) for m in multipliers)
-            else:
-                denominator = _quantized_denominator(codes, scales) if multipliers and reference_bits is None else None
-                # Reserve space for the winner, previous candidate, and next encoded output.
-                batch_size = len(grid) if encode is None else _NATIVE_BUFFER_BUDGET // codes.nbytes - 3
-                if encode is not None and reference_bits is not None and len(multipliers) > batch_size:
-                    try:
-                        cache = _ReferenceCache(reference_bits, group_size)
-                    except MemoryError:
-                        pass
-                candidates = (
-                    item
-                    for i in range(0, len(multipliers), batch_size)
-                    for item in _measure_batch(
-                        codes, scales, reference_bits, group_size, multipliers[i:i + batch_size],
-                        encode, denominator, max_error, cache,
-                    )
-                )
-            for trial, payload in candidates:
-                if trial is None or trial.added_error > max_error or trial.total_bytes >= baseline.total_bytes:
-                    continue
-                if _rank(trial, codes.size, target_bpw) < _rank(best, codes.size, target_bpw):
-                    best, best_payload = trial, payload
+    try:
+        baseline = _measure(codes, scales, reference_bits, group_size, 1.0)
+    except ValueError as error:
+        raise ValueError(f"{weight!r}: {error}") from error
+    assert baseline is not None
+    best = baseline
+    if 8 * baseline.weight.nbytes / codes.size > target_bpw:
+        max_scale = float(scales.max())
+        grid = WIDE_SCALE_MULTIPLIERS if wide_grid else SCALE_MULTIPLIERS
+        multipliers = tuple(m for m in grid[1:] if max_scale * m <= _FP32_MAX)
+        if search == "reference":
+            candidates = (_measure(codes, scales, reference_bits, group_size, m) for m in multipliers)
+        else:
+            denominator = _quantized_denominator(codes, scales) if multipliers and reference_bits is None else None
+            candidates = _measure_batch(codes, scales, reference_bits, group_size, multipliers, denominator, max_error)
+        for trial in candidates:
+            if trial is None or trial.added_error > max_error or trial.total_bytes >= baseline.total_bytes:
+                continue
+            if _rank(trial, codes.size, target_bpw) < _rank(best, codes.size, target_bpw):
+                best = trial
 
     if best is not baseline:
         optimized_codes = np.empty_like(codes, subok=False)
         optimized_scales = np.empty_like(scales, subok=False)
-        for rows, q1, s1, _, _ in _candidate_rows(codes, scales, reference_bits, group_size, best.multiplier, cache):
+        for rows, q1, s1, _, _ in _candidate_rows(codes, scales, reference_bits, group_size, best.multiplier):
             optimized_codes[rows] = q1
             optimized_scales[rows] = s1
         codes, scales = optimized_codes, optimized_scales
-    return Optimization(codes, scales, baseline, best, target_bpw, best_payload, "zlib" if encode is None else "libdeflate")
+    return Optimization(codes, scales, baseline, best, target_bpw)

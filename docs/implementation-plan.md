@@ -1,10 +1,12 @@
+> Historical implementation plan; codec references have been updated. See [archive format](archive-format.md) for the current contract.
+
 # PotatoForge Quant Compress v0.1.0 implementation plan
 
 ## Mission and scope
 
 Build a standalone Python CLI for rate-aware lossy storage compression of existing INT8 ConvRot safetensors checkpoints. Compression can adjust selected INT8 weight codes and row scales within a per-tensor distortion cap. Decoding restores an ordinary INT8 ConvRot checkpoint with the original quantization markers, tensor layout, and metadata.
 
-The four commands are `inspect`, `compress`, `decompress`, and `verify`. Version 0.1 uses the `wider-scale` optimization method and Python's standard-library zlib implementation of DEFLATE. The original BF16 checkpoint is optional during fitting. The compressed checkpoint contains everything required to decode.
+The four commands are `inspect`, `compress`, `decompress`, and `verify`. The `wider-scale` optimization method uses Zstandard level 1. The original BF16 checkpoint is optional during fitting. The compressed checkpoint contains everything required to decode.
 
 The CLI runs on CPU and requires Python 3.11+, NumPy, and safetensors. Keep the implementation independent of PotatoForge's training and quantization code. Prior Anima and Kroma research informs the scale search and baseline comparisons. Direct model loading belongs in a separate ComfyUI loader repository. The v0.1 scope excludes runtime inference, CUDA kernels, activation capture, sensitivity optimization, lossy optimization of other quantization formats, GUI, asynchronous jobs, and runtime configuration files.
 
@@ -14,7 +16,7 @@ The CLI runs on CPU and requires Python 3.11+, NumPy, and safetensors. Keep the 
 uv sync
 uv run pf-compress inspect .\model.safetensors
 uv run pf-compress compress .\model.safetensors --target-bpw 6.5
-uv run pf-compress compress .\model.safetensors --target-bpw 6.5 --max-error 0.001 --method wider-scale --protect 'blocks.18.' --reference .\original-bf16.safetensors --output .\guided.pfqc.safetensors
+uv run pf-compress compress .\model.safetensors --target-bpw 6.5 --max-error 0.001 --protect 'blocks.18.' --reference .\original-bf16.safetensors --output .\guided.pfqc.safetensors
 uv run pf-compress inspect .\model.pfqc.safetensors
 uv run pf-compress verify .\model.pfqc.safetensors
 uv run pf-compress verify .\model.pfqc.safetensors --reference-quantized .\model.safetensors
@@ -40,7 +42,7 @@ With BF16, require the exact logical weight key, shape, and BF16 dtype. Rotate t
 
 1. Start with multiplier 1.0 and preserve the exact source codes and scales. Operate on one tensor and bounded row batches. Keep FP32 row scales.
 2. Use the deterministic grid `1.0, 1.025, 1.05, 1.1, 1.2, 1.35, 1.5, 1.75, 2.0`. Widen the scales, round `Wref / s1` to nearest with ties to even, and clamp to `[-128,127]`. Use `W0` or the rotated BF16 reference as `Wref`. Preserve zero rows and reject invalid scales, excess distortion, or new nonfinite values in FP32 dequantization.
-3. Price the actual level-3 raw DEFLATE payload for each candidate, with native I8 fallback. Include the native FP32 scale bytes in the size comparison. Use the original pair with its best weight storage representation as the baseline. Native passthrough tensors retain their source bytes.
+3. Price the actual level-1 Zstandard payload for each candidate, with native I8 fallback. Include the native FP32 scale bytes in the size comparison. Use the original pair with its best weight storage representation as the baseline. Native passthrough tensors retain their source bytes.
 4. Prefer minimum distortion among candidates that meet the target and save bytes over the baseline. If the target is missed, choose the smallest valid representation that saves bytes or use the baseline. Record rate misses explicitly. Apply the same policy independently to every eligible tensor.
 5. Encode the selected I8 codes and retain their matching native FP32 row scales. The selected payload decodes bit for bit to the post-optimization pair.
 
@@ -50,11 +52,11 @@ The distributable file is `<model-name>.pfqc.safetensors`, for example `kroma-in
 
 Use the original tensor keys. Store compressed weight streams as one-dimensional U8 tensors and preserve native tensors with their original shapes, dtypes, and values. An eligible baseline weight can use lossless storage encoding. Scales and markers use their original native layout. The manifest distinguishes unchanged tensors, losslessly coded weights, and fitted pairs. Include fit settings, actual rates, baseline sizes, and error metrics. [PFQC decoding contract](archive-format.md)
 
-Validate input with `safetensors.safe_open` and use bounded raw reads to preserve every storage dtype. Validate the manifest size, schema, tensor keys, shapes, dtype and byte counts, decoded size limits, compression ratios, hashes, and family consistency. Reject incomplete or trailing DEFLATE data. Tensor names are never used as filesystem paths.
+Validate input with `safetensors.safe_open` and use bounded raw reads to preserve every storage dtype. Validate the manifest size, schema, tensor keys, shapes, dtype and byte counts, decoded size limits, hashes, and family consistency. Reject incomplete or trailing Zstandard data. Tensor names are never used as filesystem paths.
 
 Stage encoded weights and fitted scales until the native header can be written. Stream native and staged data into a sibling temporary file. Restore checkpoints by computing aligned safetensors headers and contiguous offsets from the manifest and streaming decoded bodies in order. Close and validate the result before atomic publication. Clean up staged and incomplete files on failure.
 
-The native file structure supports standard safetensors readers. Ordinary inference loaders need the decoded tensors. Hosting platforms retain their own validation rules. A future direct loader can implement the documented decoder with safetensors and DEFLATE independently of the CLI and optimizer.
+The native file structure supports standard safetensors readers. Ordinary inference loaders need the decoded tensors. Hosting platforms retain their own validation rules. The separate ComfyUI loader implements the documented decoder independently of the CLI and optimizer.
 
 ## Resource and reporting requirements
 

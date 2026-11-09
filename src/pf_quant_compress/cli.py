@@ -1,13 +1,12 @@
 import argparse
 from io import TextIOWrapper
 import json
-import logging
 from pathlib import Path
 import sys
 
 from safetensors import SafetensorError
 
-from .archive import Archive, METHOD, compress_checkpoint, decompress_archive, has_compression_metadata
+from .archive import Archive, compress_checkpoint, decompress_archive, has_compression_metadata
 from .formats import inspect_checkpoint
 from .optimize import DEFAULT_MAX_ERROR
 from .safetensors_io import Checkpoint, atomic_output, validate_output
@@ -54,7 +53,7 @@ def _print_archive_report(report: dict, output: Path | None, verbose: bool) -> N
     if operation == "inspect":
         print(f"PFQC v{report['schema_version']} compressed safetensors, {_size(report['archive_bytes'])}")
         print(
-            f"{report['tensor_count']:,} tensors, {report['encoded_weight_count']:,} DEFLATE weight streams, "
+            f"{report['tensor_count']:,} tensors, {report['encoded_weight_count']:,} Zstandard weight streams, "
             f"{report['optimized_family_count']:,} fitted families"
         )
         print(f"Reconstructed checkpoint {_size(report['reconstructed_bytes'])}")
@@ -89,11 +88,6 @@ def _print_archive_report(report: dict, output: Path | None, verbose: bool) -> N
                 f"{report['rate_target_misses']:,} of {report['eligible_family_count']:,} eligible weights. "
                 "Best admissible results were written."
             )
-        if report["encoder_counts"]:
-            encoders = ", ".join(f"{name}: {count:,}" for name, count in sorted(report["encoder_counts"].items()))
-            print(f"Fit encoders per weight ({encoders})")
-            if report["requested_encoder"] == "libdeflate" and "zlib" in report["encoder_counts"]:
-                print(f"Zlib fallback used for {report['encoder_counts']['zlib']:,} eligible weights.")
         if report["max_added_relative_sse"] is not None:
             print(
                 f"Added relative SSE {report['mean_added_relative_sse']:.6g} mean, "
@@ -111,7 +105,7 @@ def _print_archive_report(report: dict, output: Path | None, verbose: bool) -> N
                 miss = ", target missed" if fit["rate_target_missed"] else ""
                 print(
                     f"  {fit['weight']!r}  {before:,} -> {after:,} bytes, {fit['payload_bpw']:.3f} bpw, "
-                    f"{fit['encoder']}, scale x{fit['multiplier']:g}, "
+                    f"scale x{fit['multiplier']:g}, "
                     f"added SSE {fit['added_relative_sse']:.6g}{delta}{miss}"
                 )
     elif operation == "decompress":
@@ -189,10 +183,8 @@ def main(argv: list[str] | None = None) -> int:
         "--max-error", default=DEFAULT_MAX_ERROR, type=float,
         help="Per-tensor added relative squared error cap (default %(default)s)",
     )
-    compress.add_argument("--method", choices=[METHOD], default=METHOD)
-    compress.add_argument("--encoder", choices=["zlib", "libdeflate"], default="zlib", help="Raw DEFLATE encoder")
     compress.add_argument("--search", choices=["batch-major", "reference"], default="batch-major",
-                          help="Exhaustive evaluation order. Reference search uses zlib.")
+                          help="Exhaustive evaluation order.")
     compress.add_argument("--wide-grid", action="store_true",
                           help="Try experimental scale multipliers up to 14x (requires --max-error > 0.001)")
     compress.add_argument("--protect", action="append", default=[], metavar="PREFIX", help="Protect a logical weight prefix")
@@ -206,9 +198,6 @@ def main(argv: list[str] | None = None) -> int:
     verify.add_argument("model", type=Path, metavar="archive")
     verify.add_argument("--reference-quantized", type=Path, help="Compare against the original quantized checkpoint")
     args = parser.parse_args(argv)
-    if args.verbose:
-        logging.basicConfig(level=logging.INFO, format="%(message)s")
-
     try:
         output = getattr(args, "output", None) or _default_output(args.command, args.model)
         report_inputs = tuple(path for path in (
@@ -229,7 +218,7 @@ def main(argv: list[str] | None = None) -> int:
             report = compress_checkpoint(
                 args.model, output, target_bpw=args.target_bpw, max_error=args.max_error,
                 protect=tuple(args.protect), reference=args.reference, force=args.force,
-                encoder=args.encoder, search=args.search, wide_grid=args.wide_grid,
+                search=args.search, wide_grid=args.wide_grid, progress=lambda message: print(message, flush=True),
             )
         elif args.command == "decompress":
             report = decompress_archive(
@@ -243,7 +232,7 @@ def main(argv: list[str] | None = None) -> int:
             with atomic_output(args.report, force=args.force, inputs=report_inputs) as temporary:
                 encoded = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False)
                 temporary.write_text(encoded + "\n", encoding="utf-8", newline="\n")
-    except (OSError, SafetensorError, ValueError, RecursionError, OverflowError) as error:
+    except (OSError, SafetensorError, ValueError, RuntimeError, RecursionError, OverflowError) as error:
         print(f"pf-compress: error: {error}", file=sys.stderr)
         return 1
 
