@@ -6,3 +6,11 @@ build/
 dist/
 *.safetensors
 .pfqc-*.tmp
+
+# Local experiment scripts and results
+/experiments/
+/reports/
+/anima-*.json
+/moss-*.json
+/moss-*.jsonl
+/moss_*.py
